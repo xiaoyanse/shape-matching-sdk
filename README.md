@@ -48,6 +48,21 @@ from shape_sdk import train_model, NativeModel, match_batch
   自动检测上游更新
 - OpenCV 运行库随制品分发（当前 opencv_world 4.10），与消费方自持的其他 OpenCV 版本互不共享
 
+## 绑定路线图
+
+C ABI 单合同 + 官方绑定按真实消费方滚动补齐（不做全家桶）：
+
+| 语言 | 状态 | 说明 |
+| --- | --- | --- |
+| C/C++ | 已支持 | `include/shape_matching.h` 头文件即绑定；后续补最小使用示例 |
+| Python | 已支持 | `bindings/python/shape_sdk`（ctypes，manifest 校验内置） |
+| Rust | 规划（第一优先） | FFI 声明 + 句柄/错误翻译安全封装 |
+| C# | 按需 | P/Invoke，消费方出现时补官方包 |
+| Java/Kotlin | 按需 | JNA 优先、JNI 备选；目标平台（JVM/Android）明确后实施 |
+
+非承诺范围：Linux/macOS/移动端二进制与交叉编译不在当前 Windows x64 包内，
+需要时按平台扩展工程单独立项。
+
 ## 目录结构
 
 ```
