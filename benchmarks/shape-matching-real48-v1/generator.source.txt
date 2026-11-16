@@ -1,0 +1,289 @@
+"""形状匹配引擎对比基准：自研 native vs HALCON（调研 R-2026-10-24）。
+
+用法（两引擎各用各自 venv 跑，输出同构 JSON 再汇总）：
+  # 生成基准集（本项目 venv，依赖 numpy/cv2）
+  python shape_match_vs_halcon.py gen --dir <基准目录>
+  # native 引擎（本项目 venv）
+  python shape_match_vs_halcon.py run --engine native --dir <基准目录> --out native.json
+  # halcon 引擎（halcon venv，只依赖 mvtec-halcon+PIL）
+  python shape_match_vs_halcon.py run --engine halcon --dir <基准目录> --out halcon.json
+  # 汇总（任一 venv）
+  python shape_match_vs_halcon.py compare --native native.json --halcon halcon.json
+
+基准集设计（真值精确已知）：
+  合成工件目标（同心圆+辐条+细密刻度纹理+角向标记，程序确定性生成），
+  变换族：平移 9 例 / 旋转 -30..+30° 每 5° / 缩放 0.9-1.1 / 光照 ±30% /
+  高斯噪声 σ=10,20 / 多目标 3 实例。真值写入 manifest.json。
+  分辨率档：1280x720 与 2560x1440（高分辨率性能档）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import time
+from pathlib import Path
+
+
+def synth_target(size: int = 320) -> "object":
+    """确定性合成工件（numpy BGR），含纹理细节（辐条+刻度+角向不对称标记）。"""
+    import cv2
+    import numpy as np
+
+    img = np.full((size, size, 3), 60, dtype=np.uint8)
+    c = size // 2
+    cv2.circle(img, (c, c), size // 2 - 6, (200, 180, 160), -1)
+    cv2.circle(img, (c, c), size // 2 - 26, (60, 50, 40), 3)
+    cv2.circle(img, (c, c), size // 3, (200, 180, 160), -1)
+    cv2.circle(img, (c, c), size // 3 - 14, (70, 60, 50), 2)
+    for i in range(12):  # 辐条纹理
+        a = i * 2 * math.pi / 12
+        p1 = (int(c + math.cos(a) * size * 0.12), int(c + math.sin(a) * size * 0.12))
+        p2 = (int(c + math.cos(a) * size * 0.44), int(c + math.sin(a) * size * 0.44))
+        cv2.line(img, p1, p2, (40, 35, 30), 5)
+    for i in range(60):  # 细密刻度（纹理敏感特征）
+        a = i * 2 * math.pi / 60
+        p1 = (int(c + math.cos(a) * size * 0.40), int(c + math.sin(a) * size * 0.40))
+        p2 = (int(c + math.cos(a) * size * 0.46), int(c + math.sin(a) * size * 0.46))
+        cv2.line(img, p1, p2, (25, 22, 20), 2)
+    cv2.circle(img, (c + size // 5, c), 14, (30, 200, 220), -1)  # 角向标记（破坏旋转对称）
+    rr = np.random.default_rng(3)  # 边缘密度增强：环形随机小块（引擎依赖边缘特征密度）
+    for i in range(24):
+        a = rr.uniform(0, 2 * math.pi)
+        r = rr.uniform(size * 0.18, size * 0.30)
+        px, py = int(c + math.cos(a) * r), int(c + math.sin(a) * r)
+        s = rr.integers(8, 20)
+        col = tuple(int(v) for v in rr.integers(20, 240, 3))
+        cv2.rectangle(img, (px - s // 2, py - s // 2), (px + s // 2, py + s // 2), col, -1)
+    return img
+
+
+def _place(canvas: "object", target: "object", cx: int, cy: int, angle_deg: float, scale: float) -> "object":
+    import cv2
+    import numpy as np
+
+    h, w = target.shape[:2]
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle_deg, scale)
+    rotated = cv2.warpAffine(target, m, (w, h))
+    th, tw = rotated.shape[:2]
+    H, W = canvas.shape[:2]
+    x0, y0 = max(0, cx - tw // 2), max(0, cy - th // 2)
+    x1, y1 = min(W, x0 + tw), min(H, y0 + th)
+    rotated = rotated[y0 - max(0, cy - th // 2) : y1 - max(0, cy - th // 2),
+                       x0 - max(0, cx - tw // 2) : x1 - max(0, cx - tw // 2)]
+    roi = canvas[y0:y1, x0:x1]
+    mask = rotated.max(axis=2) > 80
+    roi[mask] = rotated[mask]
+    canvas[y0:y1, x0:x1] = roi
+    return canvas
+
+
+def cmd_gen(args: argparse.Namespace) -> None:
+    """真实图基准：046-halcon 工作台 2000 万像素实拍图（缩至 4096 限内）+
+    已知仿射变换真值测试集。对两引擎公平且贴近现场纹理。"""
+    import cv2
+    import numpy as np
+
+    root = Path(args.dir)
+    (root / "images").mkdir(parents=True, exist_ok=True)
+    manifest: dict = {"cases": [], "roi_xywh": None, "reference": {}}
+
+    src = sorted(Path(args.sources).glob("*.png"))[: int(args.num_images)]
+    for idx, src_path in enumerate(src):
+        raw = cv2.imread(str(src_path))
+        if raw is None:
+            continue
+        h, w = raw.shape[:2]
+        scale = min(1.0, 4096 / max(w, h))  # native 引擎接口限 4096
+        base = cv2.resize(raw, (int(w * scale), int(h * scale))) if scale < 1.0 else raw
+        bh, bw = base.shape[:2]
+        cx, cy = bw // 2, bh // 2
+        res_name = f"img{idx}"
+        # 梯度密度代理挑最强纹理 500x500 窗（LINE-MOD 特征与梯度强相关）
+        gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+        grad = cv2.magnitude(cv2.Sobel(gray, cv2.CV_32F, 1, 0), cv2.Sobel(gray, cv2.CV_32F, 0, 1))
+        best, roi = -1.0, None
+        for oy in range(200, bh - 700, 250):
+            for ox in range(200, bw - 700, 250):
+                s = float(grad[oy : oy + 500, ox : ox + 500].sum())
+                if s > best:
+                    best, roi = s, (ox, oy, 500, 500)
+        cx, cy = roi[0] + 250, roi[1] + 250
+        ref_path = root / "images" / f"ref_{res_name}.png"
+        cv2.imwrite(str(ref_path), base)
+        manifest["reference"][res_name] = {"path": str(ref_path), "roi": list(roi)}
+
+        def add_case(name: str, warp: tuple[float, float, float], extra: dict | None = None) -> None:
+            """warp=(dx,dy,angle)：绕 ROI 中心旋转+平移整图，真值=ROI 中心同变换。"""
+            dx, dy, ang = warp
+            m = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
+            m[0, 2] += dx
+            m[1, 2] += dy
+            img = cv2.warpAffine(base, m, (bw, bh), borderValue=(60, 60, 60))
+            # 真值：ROI 中心点经同一仿射
+            tx = m[0, 0] * cx + m[0, 1] * cy + m[0, 2]
+            ty = m[1, 0] * cx + m[1, 1] * cy + m[1, 2]
+            if extra:  # 光照/噪声
+                img = extra.get("fn", lambda i: i)(img)
+            p = root / "images" / f"{res_name}_{name}.png"
+            cv2.imwrite(str(p), img)
+            manifest["cases"].append({"image": str(p), "res": res_name, "name": name, "tx": tx, "ty": ty, "angle": float(ang), "scale": 1.0})
+
+        add_case("t0", (0, 0, 0))
+        add_case("t1", (-120, -60, 0))
+        add_case("t2", (80, 100, 0))
+        add_case("t3", (-200, 150, 0))
+        for a in (-30, -20, -10, -5, 5, 10, 20, 30):
+            add_case(f"r{a}", (30, -20, a))
+        add_case("bright", (0, 0, 0), {"fn": lambda i: np.clip(i.astype(np.float64) * 1.3, 0, 255).astype(np.uint8)})
+        add_case("dark", (0, 0, 0), {"fn": lambda i: np.clip(i.astype(np.float64) * 0.7, 0, 255).astype(np.uint8)})
+        for s, tag in ((10, "n10"), (20, "n20")):
+            rng = np.random.default_rng(idx * 100 + s)
+            add_case(tag, (40, 30, 8), {"fn": lambda i, rng=rng, s=s: np.clip(i.astype(np.int16) + rng.integers(-s, s, i.shape), 0, 255).astype(np.uint8)})
+
+    (root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"生成完成：{len(manifest['cases'])} 例 -> {root}")
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    root = Path(args.dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    results: dict = {"engine": args.engine, "train": {}, "cases": []}
+
+    if args.engine == "native":
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "apps" / "business-server" / "python" / "src"))
+        import cv2
+        import numpy as np
+
+        from visionforge.shape_matching.infrastructure.native import NativeModel, train_model
+
+        for res, refinfo in manifest["reference"].items():
+            ref_path, roi = refinfo["path"], tuple(refinfo["roi"])
+            ref = cv2.imread(ref_path)
+            t0 = time.perf_counter()
+            model_bytes = train_model(
+                ref, roi,
+                angle_min=-30.0, angle_max=30.0, angle_step=4.0,
+                scale_min=0.9, scale_max=1.1, scale_step=0.1,
+            )
+            train_ms = (time.perf_counter() - t0) * 1000
+            model = NativeModel(model_bytes)
+            results["train"][res] = {"train_ms": round(train_ms, 2), "model_kb": round(len(model_bytes) / 1024, 1)}
+            for case in [c for c in manifest["cases"] if c["res"] == res]:
+                img = cv2.imread(case["image"])
+                times, matches = [], []
+                for _ in range(5):  # 5 次取分布
+                    t0 = time.perf_counter()
+                    cands = model.match(img, threshold=70.0, max_candidates=8)
+                    times.append((time.perf_counter() - t0) * 1000)
+                    matches = [
+                        {"cx": c.center[0], "cy": c.center[1], "score": c.score / 100.0, "angle_deg": c.angle, "scale": c.scale}
+                        for c in cands
+                    ]
+                results["cases"].append({**case, "matches": matches[:3], "match_ms_median": round(statistics.median(times), 2), "match_ms_min": round(min(times), 2)})
+            model.close()
+
+    elif args.engine == "halcon":
+        import halcon as ha
+        import numpy as np
+        from PIL import Image
+
+        # ffi 初始化怪癖：未先用图像算子触发 init 时 region 生成静默产出错误
+        # 几何（实测 gen_rectangle1 90601 -> 784），必须先 read_image 一次。
+        _first = next(iter(manifest["reference"].values()))
+        ha.get_image_size(ha.read_image(_first["path"]))
+
+        def imread_bgr(path: str) -> np.ndarray:
+            arr = np.asarray(Image.open(path).convert("RGB"))
+            return arr[:, :, ::-1].copy()
+
+        for res, refinfo in manifest["reference"].items():
+            ref_path, roi = refinfo["path"], tuple(refinfo["roi"])
+            t0 = time.perf_counter()
+            model = ha.create_generic_shape_model()
+            ha.set_generic_shape_model_param(model, ["metric", "iso_scale_min", "iso_scale_max"], ["use_polarity", 0.85, 1.15])
+            region = ha.gen_rectangle2(
+                roi[1] + roi[3] / 2,
+                roi[0] + roi[2] / 2,
+                0.0, roi[2] / 2, roi[3] / 2,
+            )
+            ref_img = ha.rgb1_to_gray(ha.read_image(str(ref_path)))
+            ha.train_generic_shape_model(ha.reduce_domain(ref_img, region), model)
+            train_ms = (time.perf_counter() - t0) * 1000
+            results["train"][res] = {"train_ms": round(train_ms, 2)}
+            for case in [c for c in manifest["cases"] if c["res"] == res]:
+                img = ha.rgb1_to_gray(ha.read_image(case["image"]))
+                ha.set_generic_shape_model_param(model, ["min_score", "num_matches", "angle_start", "angle_end"], [0.7, 8, math.radians(-30), math.radians(30)])
+                times, matches = [], []
+                for _ in range(5):
+                    t0 = time.perf_counter()
+                    result, count = ha.find_generic_shape_model(img, model)
+                    times.append((time.perf_counter() - t0) * 1000)
+                    matches = []
+                    for i in range(count):
+                        g = lambda k: ha.get_generic_shape_model_result(result, i, k)[0]
+                        matches.append({"cy": g("row"), "cx": g("column"), "score": g("score"), "angle_deg": math.degrees(g("angle")), "scale": g("scale_row")})
+                    ha.clear_handle(result)
+                results["cases"].append({**case, "matches": matches[:3], "match_ms_median": round(statistics.median(times), 2), "match_ms_min": round(min(times), 2)})
+            ha.clear_shape_model(model)
+
+    Path(args.out).write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"{args.engine} 完成：{len(results['cases'])} 例 -> {args.out}")
+
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    nat = json.loads(Path(args.native).read_text(encoding="utf-8"))
+    hal = json.loads(Path(args.halcon).read_text(encoding="utf-8"))
+
+    def pos_err(m: dict, t: dict) -> float:
+        return math.hypot(m["cx"] - t["tx"], m["cy"] - t["ty"])
+
+    print(f"{'例':<10}{'引擎':<7}{'pos_err(px)':<12}{'angle_err(°)':<13}{'score':<8}{'ms(中位)':<10}")
+    agg: dict = {"native": [], "halcon": []}
+    for nc, hc in zip(nat["cases"], hal["cases"]):
+        assert nc["name"] == hc["name"], "基准集不一致"
+        if nc.get("multi"):
+            continue
+        t = nc
+        for engine, case in (("native", nc), ("halcon", hc)):
+            if not case["matches"]:
+                print(f"{nc['name']:<10}{engine:<7}{'未匹配':<12}")
+                continue
+            m = case["matches"][0]
+            ae = abs(m.get("angle_deg", m.get("angle", 0.0)) - t["angle"])
+            e = pos_err(m, t)
+            agg[engine].append({"e": e, "ae": ae, "ms": case["match_ms_median"], "res": nc["res"]})
+            print(f"{nc['name']:<10}{engine:<7}{e:<12.2f}{ae:<13.3f}{m['score']:<8.3f}{case['match_ms_median']:<10.2f}")
+    print("\n=== 汇总（剔除多目标例）===")
+    for engine, rows in agg.items():
+        es = [r["e"] for r in rows]
+        aes = [r["ae"] for r in rows]
+        ms = [r["ms"] for r in rows]
+        ms72 = [r["ms"] for r in rows if r["res"] == rows[0]["res"]]
+        ms144 = [r["ms"] for r in rows]
+        print(f"{engine}: pos_err 中位={statistics.median(es):.2f}px 最大={max(es):.2f}px | "
+              f"angle_err 中位={statistics.median(aes):.3f}° 最大={max(aes):.3f}° | "
+              f"匹配耗时 首图组中位={statistics.median(ms72):.1f}ms 全体中位={statistics.median(ms144):.1f}ms")
+    print("\n=== 建模耗时 ===")
+    print("native:", nat["train"])
+    print("halcon:", hal["train"])
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("gen"); g.add_argument("--dir", required=True)
+    g.add_argument("--sources", default=r"E:\projects\046-halcon\data\inputs\images")
+    g.add_argument("--num-images", default=3); g.set_defaults(func=cmd_gen)
+    r = sub.add_parser("run"); r.add_argument("--engine", choices=["native", "halcon"], required=True); r.add_argument("--dir", required=True); r.add_argument("--out", required=True); r.set_defaults(func=cmd_run)
+    c = sub.add_parser("compare"); c.add_argument("--native", required=True); c.add_argument("--halcon", required=True); c.set_defaults(func=cmd_compare)
+    a = p.parse_args()
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()

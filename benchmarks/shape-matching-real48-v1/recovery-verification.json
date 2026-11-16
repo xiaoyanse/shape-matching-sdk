@@ -1,0 +1,35 @@
+{
+  "fixture_id": "shape-matching-real48-v1",
+  "verified_on": "2026-10-27",
+  "scope": "source and deterministic reconstruction only; no native matching, training, HALCON, device or live database operation",
+  "uploaded_source_hashes_verified": 3,
+  "historical_model_hashes_verified": 3,
+  "gradient_rois_equal_historical": 3,
+  "embedded_template_roi_pixel_equality": [true, true, true],
+  "historical_manifest_reconstructed_sha256": "6700b84c35c3b2db22b619e917b5bde393be7898ee1d86e52fc1ce5bb63d835d",
+  "historical_case_names_order_and_truth_verified": 48,
+  "historical_result_errors_recomputed": 48,
+  "reconstruction": {
+    "command": "preserve_shape_benchmark.py rebuild --output build/verification/shape-real48-wrapper-check",
+    "case_count": 48,
+    "reference_count": 3,
+    "decoded_pixel_hashes_verified": 51,
+    "normalized_manifest_equal": true,
+    "derived_png_total_bytes": 274272165,
+    "repeat_generation_pixels_identical": true,
+    "opencv_version": "5.0.0",
+    "wrapper_check_large_copy_removed_after_validation": true
+  },
+  "negative_checks": {
+    "existing_output_rejected_and_unchanged": true,
+    "fixture_as_output_rejected": true,
+    "outside_build_output_rejected": true,
+    "wrong_historical_manifest_hash_rejected": true,
+    "wrong_derived_pixel_hash_rejected": true
+  },
+  "limitations": [
+    "Historical derived PNG bytes and pixel hashes were not retained; their byte identity is not asserted.",
+    "Current full 48-case precision and performance, dual-target and field acceptance are separate checks.",
+    "Only local Git and LFS preservation; remote backup has not been performed."
+  ]
+}

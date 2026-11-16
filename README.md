@@ -48,6 +48,17 @@ from shape_sdk import train_model, NativeModel, match_batch
   自动检测上游更新
 - OpenCV 运行库随制品分发（当前 opencv_world 4.10），与消费方自持的其他 OpenCV 版本互不共享
 
+## 基准与回归
+
+- `benchmarks/run_facts.py`：**端到端确定性基准**（官方绑定 + shape-facts v1 合成事实帧）——帧 1 训练锚模板（±30°/5°、单尺度），对四帧匹配并对照 spec 预期真值（在场性 + 中心定位 ≤8px），输出训练/逐帧耗时。当前基线：训练 ~0.6s（13 位姿）、匹配 5–10ms/帧（1280×960）、四帧全过（中心偏差 <0.2px、零误报）
+- `benchmarks/shape-facts-v1/`：合成基准资产（4 帧确定性 PNG + 图案生成器源码 + 机器可读规格含预期真值与字节哈希）
+- `benchmarks/shape-matching-real48-v1/`：48 例真实素材基准（4 平移×8 旋转×2 亮度×2 噪声，含历史结果真值指纹与生成器源档）
+- `tests/`：C++ 单元回归（几何精修/帧准备/粗图/聚类，`-BuildTests` 启用）
+- `scripts/smoke_binding.py`：绑定加载冒烟（manifest 校验 + ABI 协商）
+
+引擎改动后跑 `run_facts.py` 与 CTest 作为最低回归门；性能对比基准（多线程批量、
+与第三方引擎对拍）由消费方按需在其环境构建。
+
 ## 绑定路线图
 
 C ABI 单合同 + 官方绑定按真实消费方滚动补齐（不做全家桶）：

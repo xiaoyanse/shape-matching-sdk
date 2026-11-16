@@ -1,0 +1,28 @@
+{
+  "asset_schema": "shape-facts-fixture/1",
+  "template_version": "anchor@v1+target@v1",
+  "template_algorithm": {
+    "implementation": "preserved POC shape_poc::trainTemplate",
+    "source_file": "source/vision_facts.cpp",
+    "canvas_px": [540, 540],
+    "crop_px": [260, 260],
+    "crop_origin_px": [140, 140],
+    "rotation_bank_degrees": [-25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25],
+    "score_threshold": 70.0,
+    "anchor_pattern": "dark asymmetric square outline, eccentric filled circle, closed triangle; coordinates in source/vision_facts.cpp",
+    "target_pattern": "dark filled circle, eccentric filled square, eccentric ring; coordinates in source/vision_facts.cpp",
+    "background": "BGR 150 plus 900 deterministic low-contrast circles seeded per frame"
+  },
+  "frame_spec": {
+    "size_px": [1280, 960],
+    "format": "PNG, original unannotated BGR source frame",
+    "scene_seed_by_frame": {"1": 7, "2": 8, "3": 9, "4": 10},
+    "anchor_center_and_angle": {"1": [[600, 420], 15], "2": null, "3": [[600, 420], 15], "4": [[620, 400], -10]},
+    "target_presence": {"1": true, "2": true, "3": false, "4": true}
+  },
+  "poc_git_head": "890d7ca24b7e20c205c45db7fd416c3416c27460",
+  "field_template_poc_git_head": "ee6f3a29aa729380d5562b765a3ea6a3bf3b61e7",
+  "template_source_sha256": "FD83BAD74F900059F8A505BA9B080F2238B33CA7C1E79CEB9502DA394AD6F382",
+  "template_header_sha256": "418FB66AF43A31DBB31833A81B66A9B21E49AA62F56DF74033A6944446DF234F",
+  "poc_main_sha256": "E33A86517FB9453F0B0D24513ABD0B037C72139DC6E366A4B184F6500AAF5BAD"
+}
