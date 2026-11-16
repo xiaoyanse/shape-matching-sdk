@@ -67,11 +67,10 @@ std::vector<uint8_t> encode(const Model& model) {
     Writer out;
     out.integer(1); out.integer(model.width); out.integer(model.height);
     write_config(out, model.config);
-    // detector 参数随模型序列化（自包含；decode 侧按值重建）
-    const int enc_features = model.config.feature_count > 0 ? model.config.feature_count : feature_count;
-    const float enc_weak = model.config.weak_th > 0 ? float(model.config.weak_th) : weak_threshold;
-    const float enc_strong = model.config.strong_th > 0 ? float(model.config.strong_th) : strong_threshold;
-    out.integer(enc_features); out.number(enc_weak); out.number(enc_strong);
+    // detector 参数随模型序列化（自包含；取构造时快照的实际生效值）
+    out.integer(model.detector.tuned_features);
+    out.number(model.detector.tuned_weak);
+    out.number(model.detector.tuned_strong);
     out.integer(uint32_t(model.poses.size()));
     for (size_t id = 0; id < model.poses.size(); ++id) {
         const auto& pose = model.poses[id];
@@ -104,11 +103,13 @@ std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size) {
     validate_config(config, dec_width, dec_height);
     const int dec_features = in.bounded(16, max_features_per_level);
     const double dec_weak = in.number(), dec_strong = in.number();
-    require(0 < dec_weak && dec_weak <= dec_strong && dec_strong <= 255,
-            "unsupported detector parameters");
-    // 参数化重建（旧模型三值=训练期常量，读回即原值）
-    auto model = std::make_shared<Model>(dec_features, float(dec_weak), float(dec_strong));
+    const auto tuning = validate_detector_params(dec_features, dec_weak, dec_strong);
+    auto model = std::make_shared<Model>(tuning.features, tuning.weak, tuning.strong);
     model->width = dec_width; model->height = dec_height; model->config = config;
+    // 回填实际生效三参：metadata 与二次导出的稳定来源（零值不再表示默认）
+    model->config.feature_count = tuning.features;
+    model->config.weak_th = tuning.weak;
+    model->config.strong_th = tuning.strong;
     const auto angles = samples(model->config.angle_min, model->config.angle_max,
                                model->config.angle_step, -180, 180);
     const auto scales = samples(model->config.scale_min, model->config.scale_max,

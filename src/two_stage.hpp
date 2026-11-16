@@ -34,6 +34,7 @@ struct TwoStageModel {
     cv::Mat tmpl_gray;                           // 训练 ROI 灰度图（B7 基准）
     B7Model b7;                                  // B7 轮廓点（惰性或训练期提取）
     vf_shape_train_config base_config{};         // 原始训练配置（供 B7 角度步长等）
+    int ref_width = 0, ref_height = 0;           // 原始参考图尺寸；0=旧容器（元数据回退模板灰图尺寸）
 };
 
 // 容器编解码（VF2S3 字节级兼容；返回 nullptr 表示非容器格式）

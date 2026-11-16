@@ -41,13 +41,21 @@ std::vector<double> samples(double low, double high, double step, double min, do
     return values;
 }
 
+DetectorTuning validate_detector_params(int features, double weak, double strong) {
+    const int f = features == 0 ? feature_count : features;
+    const double w = weak == 0 ? weak_threshold : weak;
+    const double s = strong == 0 ? strong_threshold : strong;
+    require(std::isfinite(w) && std::isfinite(s), "detector thresholds must be finite");
+    require(w > 0 && s > 0, "detector thresholds must be positive");
+    require(w <= s, "weak threshold must not exceed strong threshold");
+    require(s <= kMaxStrongThreshold, "strong threshold exceeds reachable gradient magnitude (1020)");
+    require(f >= 16 && f <= max_features_per_level, "feature count per level must be 16-512");
+    return {f, float(w), float(s)};
+}
+
 void validate_config(const vf_shape_train_config& c, int width, int height) {
     require(c.struct_size == sizeof(c), "invalid training ABI structure size");
-    require(c.weak_th >= 0 && c.strong_th >= 0, "detector thresholds must be non-negative");
-    require(c.weak_th == 0 || c.strong_th == 0 || c.weak_th <= c.strong_th,
-            "weak threshold must not exceed strong threshold");
-    require(c.feature_count == 0 || (16 <= c.feature_count && c.feature_count <= 512),
-            "feature count per level must be 16-512");
+    validate_detector_params(c.feature_count, c.weak_th, c.strong_th);
     require(c.roi_x >= 0 && c.roi_y >= 0 && c.roi_width >= 24 && c.roi_height >= 24 &&
             c.roi_width <= width && c.roi_height <= height &&
             c.roi_x <= width - c.roi_width && c.roi_y <= height - c.roi_height, "invalid training ROI");
@@ -76,12 +84,8 @@ std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& 
                     p.strong_th == c.strong_th && p.feature_count == c.feature_count,
                 "overlapping groups must share reference geometry and detector parameters");
     }
-    // 特征筛选参数化：0=历史默认（128/30/60）；模型重建（codec 读回）
-    // 时三值从序列化 config 复原，帧准备与模型特征选择始终同参。
-    const int features = c.feature_count > 0 ? c.feature_count : feature_count;
-    const float weak_th = c.weak_th > 0 ? float(c.weak_th) : weak_threshold;
-    const float strong_th = c.strong_th > 0 ? float(c.strong_th) : strong_threshold;
-    auto model = std::make_shared<Model>(features, weak_th, strong_th);
+    const auto tuning = validate_detector_params(c.feature_count, c.weak_th, c.strong_th);
+    auto model = std::make_shared<Model>(tuning.features, tuning.weak, tuning.strong);
     model->config = c; model->width = image.cols; model->height = image.rows;
     const auto angles = samples(c.angle_min, c.angle_max, c.angle_step, -180, 180, 360);
     const auto scales = samples(c.scale_min, c.scale_max, c.scale_step, .25, 2);

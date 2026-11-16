@@ -13,6 +13,9 @@ constexpr int feature_count = 128;
 constexpr int max_features_per_level = 512;
 constexpr float weak_threshold = 30.0f;
 constexpr float strong_threshold = 60.0f;
+// 上限依据：vendor 3×3 Sobel 经 7×7 高斯平滑（凸组合，值域仍 0..255）单方向
+// 响应 ≤ 4×255=1020；阈值在平方域比较，幅度范数上界 1020√2≈1442，取保守的单方向口径。
+constexpr double kMaxStrongThreshold = 1020.;
 
 inline void require(bool condition, const char* message) {
     if (!condition) throw std::invalid_argument(message);
@@ -24,7 +27,12 @@ public:
     // 特征数上限——虚警治理的建模期入口。默认值=历史行为（128/30/60）。
     explicit Detector(int features = feature_count, float weak_th = weak_threshold,
                       float strong_th = strong_threshold)
-        : line2Dup::Detector(features, {4, 8}, weak_th, strong_th) {}
+        : line2Dup::Detector(features, {4, 8}, weak_th, strong_th),
+          tuned_features(features), tuned_weak(weak_th), tuned_strong(strong_th) {}
+    // 生效参数快照：编码导出（模型往返参数稳定）与批量帧分组（同参共帧）的
+    // 唯一取参来源——config 三字段为零值默认语义，此处始终是实际生效值。
+    int tuned_features;
+    float tuned_weak, tuned_strong;
     void append(std::vector<line2Dup::Template> pyramid) {
         class_templates["shape"].push_back(std::move(pyramid));
     }
@@ -66,6 +74,8 @@ cv::Mat checked_image(const uint8_t* image, uint64_t size, int width, int height
 std::vector<double> samples(double low, double high, double step, double min, double max,
                             double wrap = 0);
 void validate_config(const vf_shape_train_config& config, int width, int height);
+struct DetectorTuning { int features; float weak, strong; };
+DetectorTuning validate_detector_params(int features, double weak, double strong);
 std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& config,
                              const Model* previous_group = nullptr);
 std::vector<uint8_t> encode(const Model& model);

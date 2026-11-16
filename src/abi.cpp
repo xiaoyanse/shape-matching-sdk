@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <map>
+#include <tuple>
 #include <unordered_map>
 
 namespace {
@@ -114,8 +116,11 @@ int32_t vf_shape_metadata(uint64_t handle, vf_shape_train_config* config, int32_
         std::lock_guard<std::mutex> lock(model->mutex);
         if (model->two_stage) {
             *config = model->two_stage->base_config;
-            *width = model->two_stage->tmpl_gray.cols;
-            *height = model->two_stage->tmpl_gray.rows;
+            // 参考尺寸须与 config 同处原图坐标系；旧容器 ref 字段为 0，回退模板灰图尺寸
+            *width = model->two_stage->ref_width > 0
+                         ? model->two_stage->ref_width : model->two_stage->tmpl_gray.cols;
+            *height = model->two_stage->ref_height > 0
+                          ? model->two_stage->ref_height : model->two_stage->tmpl_gray.rows;
         } else {
             *config = model->single->config; *width = model->single->width; *height = model->single->height;
         }
@@ -141,21 +146,41 @@ int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_size, int32_t 
                 vfshape::require(std::isfinite(item.threshold) && item.threshold > 0 && item.threshold <= 100,
                     "invalid similarity threshold");
                 auto model = get(item.handle);
-                vfshape::require(!model->two_stage,
-                    "two-stage models do not support batch; match individually");
-                vfshape::validate_search_budget(*model->single, width, height);
+                // 搜索预算仅约束单级共享帧匹配；两级匹配内部自管缩图与窗口预算
+                if (model->single)
+                    vfshape::validate_search_budget(*model->single, width, height);
                 models[n] = std::move(model);
                 any_valid = true;
             });
         }
         if (!any_valid) return;
-        const auto frame = vfshape::prepare_frame(image_view);
+        // 单级帧量化与模板特征选择必须同参：按生效 detector 参数分组共帧，
+        // 跨参共享 PreparedFrame 会触发 vendor 同参断言；两级匹配内部自行缩图，不共享。
+        std::map<std::tuple<int, float, float>, vfshape::PreparedFrame> frames;
+        for (uint32_t n = 0; n < item_count; ++n) {
+            if (!models[n] || !models[n]->single) continue;
+            const auto& detector = models[n]->single->detector;
+            auto key = std::make_tuple(detector.tuned_features, detector.tuned_weak,
+                                       detector.tuned_strong);
+            // emplace 对已存在键仍会求值实参——先查再插，保证同参组只备一次帧
+            if (frames.find(key) == frames.end())
+                frames.emplace(std::move(key), vfshape::prepare_frame(image_view, &detector));
+        }
         for (uint32_t n = 0; n < item_count; ++n) {
             if (!models[n]) continue;
             auto& item = items[n];
             item.status = boundary(item.error, sizeof(item.error), [&] {
                 std::lock_guard<std::mutex> lock(models[n]->mutex);
-                const auto found = vfshape::match_prepared(*models[n]->single, frame, item.threshold);
+                std::vector<vf_shape_candidate> found;
+                if (models[n]->two_stage) {
+                    found = vfshape::match_two_stage(*models[n]->two_stage, image_view,
+                                                     item.threshold, int(item.capacity));
+                } else {
+                    const auto& detector = models[n]->single->detector;
+                    const auto& frame = frames.find(std::make_tuple(
+                        detector.tuned_features, detector.tuned_weak, detector.tuned_strong))->second;
+                    found = vfshape::match_prepared(*models[n]->single, frame, item.threshold);
+                }
                 item.count = uint32_t(std::min(size_t(item.capacity), found.size()));
                 std::copy_n(found.begin(), item.count, item.candidates);
             });

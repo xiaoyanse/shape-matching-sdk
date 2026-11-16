@@ -148,6 +148,11 @@ class NativeModel:
                         "scale_min",
                         "scale_max",
                         "scale_step",
+                        # 两级容器加载件的 config 由原生端回填；旧资产回填落地前
+                        # 此三键可能为零值，0 仍表示原生默认 128/30/60 语义
+                        "weak_th",
+                        "strong_th",
+                        "feature_count",
                     )
                 },
             }
