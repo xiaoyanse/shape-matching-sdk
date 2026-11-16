@@ -76,6 +76,8 @@ std::vector<double> samples(double low, double high, double step, double min, do
 void validate_config(const vf_shape_train_config& config, int width, int height);
 struct DetectorTuning { int features; float weak, strong; };
 DetectorTuning validate_detector_params(int features, double weak, double strong);
+// 持久化三参严格校验（零=损坏拒绝，防 float 下溢洗白链）——容器/codec 加载端用
+DetectorTuning validate_persisted_detector_params(int features, double weak, double strong);
 std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& config,
                              const Model* previous_group = nullptr);
 std::vector<uint8_t> encode(const Model& model);

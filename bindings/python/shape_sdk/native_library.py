@@ -75,6 +75,16 @@ def runtime_directory() -> Path:
     return Path(__file__).resolve().parents[3] / "dist" / "runtime"
 
 
+def sdk_version() -> str:
+    manifest = json.loads(
+        (runtime_directory() / "runtime-manifest.json").read_text(encoding="utf-8")
+    )
+    version = manifest.get("sdk_version")
+    if not isinstance(version, str) or not version:
+        raise NativeShapeError("模板匹配原生清单缺少 sdk_version，请重新构建装配运行包")
+    return version
+
+
 def load_library() -> ct.CDLL:
     global _library
     with _lock:

@@ -13,6 +13,7 @@ import os
 import struct
 import subprocess
 import sys
+import zlib
 from ctypes import byref, c_uint64, create_string_buffer
 from pathlib import Path
 
@@ -21,10 +22,11 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 OPENCV_BIN = Path(os.environ.get("SHAPE_SDK_OPENCV_BIN", "C:/opencv/build/x64/vc16/bin"))
 BUILD_DLLS = (
+    ROOT / "build" / "tD2" / "Release" / "visionforge_shape.dll",
+    ROOT / "build" / "tD2" / "visionforge_shape.dll",
     ROOT / "build" / "tD" / "Release" / "visionforge_shape.dll",
     ROOT / "build" / "tD" / "visionforge_shape.dll",
 )
-ASSEMBLED_RUNTIME = ROOT / "build" / "tD" / "runtime"
 DIST_MANIFEST = ROOT / "dist" / "runtime" / "runtime-manifest.json"
 METADATA_KEYS = (
     "reference_width", "reference_height", "roi_xywh",
@@ -38,6 +40,8 @@ def assemble_runtime() -> None:
     built = next((path for path in BUILD_DLLS if path.is_file()), None)
     if built is None:
         return
+    build_root = built.parents[1]
+    runtime_dir = build_root / "runtime"
     digest = hashlib.sha256(built.read_bytes()).hexdigest()
     try:
         manifest = json.loads(DIST_MANIFEST.read_text(encoding="utf-8"))
@@ -54,10 +58,10 @@ def assemble_runtime() -> None:
         "THIRD_PARTY_NOTICES.md": ROOT / "THIRD_PARTY_NOTICES.md",
         "OpenCV.LICENSE": OPENCV_BIN.parents[2] / "LICENSE",
     }
-    ASSEMBLED_RUNTIME.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
     files = {}
     for name, source in sources.items():
-        target = ASSEMBLED_RUNTIME / name
+        target = runtime_dir / name
         target.write_bytes(source.read_bytes())
         files[name] = hashlib.sha256(target.read_bytes()).hexdigest()
     revision = anchor = ""
@@ -70,9 +74,9 @@ def assemble_runtime() -> None:
         pass
     payload = {"abi_version": 3, "platform": "windows-x64", "sdk_revision": revision,
                "anchor": anchor, "files": files}
-    (ASSEMBLED_RUNTIME / "runtime-manifest.json").write_text(
+    (runtime_dir / "runtime-manifest.json").write_text(
         json.dumps(payload, indent=1) + "\n", encoding="utf-8")
-    os.environ.setdefault("SHAPE_SDK_RUNTIME", str(ASSEMBLED_RUNTIME))
+    os.environ.setdefault("SHAPE_SDK_RUNTIME", str(runtime_dir))
 
 
 assemble_runtime()
@@ -130,6 +134,50 @@ def detector_tuple(meta: dict) -> tuple:
     return (meta["feature_count"], meta["weak_th"], meta["strong_th"])
 
 
+def make_png(width: int, height: int) -> bytes:
+    """合法 8-bit 灰度 PNG（零像素），用于容器模板段篡改探针。"""
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        return (struct.pack(">I", len(payload)) + tag + payload +
+                struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    raw = b"".join(b"\x00" + b"\x00" * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+            chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def split_container(container: bytes) -> list[bytes]:
+    assert container[:5] == b"VF2S3", "容器 magic 不符"
+    count = struct.unpack_from("<Q", container, 5)[0]
+    lengths = struct.unpack_from("<" + "Q" * (count + 3), container, 13)
+    parts, offset = [], 13 + 8 * (count + 3)
+    for length in lengths:
+        parts.append(container[offset:offset + length])
+        offset += length
+    return parts
+
+
+def rebuild_container(parts: list[bytes]) -> bytes:
+    return (b"VF2S3" + struct.pack("<Q", len(parts) - 3) +
+            struct.pack("<" + "Q" * len(parts), *map(len, parts)) + b"".join(parts))
+
+
+def with_meta(parts: list[bytes], mutate) -> bytes:
+    meta = json.loads(parts[-1].decode())
+    mutate(meta)
+    replaced = list(parts)
+    replaced[-1] = json.dumps(meta).encode()
+    return rebuild_container(replaced)
+
+
+def expect_load_reject(model_bytes: bytes, needle: str, what: str) -> None:
+    try:
+        NativeModel(model_bytes)
+        raise AssertionError(f"{what} 预期拒绝含「{needle}」，实际被接受")
+    except NativeShapeError as exc:
+        assert needle in str(exc), f"{what} 错误文本不符：{exc!r} 应含「{needle}」"
+
+
 def group_full_chain() -> None:
     reference = synth_reference()
     data = train_defaults(reference)
@@ -140,6 +188,10 @@ def group_full_chain() -> None:
         missing = [key for key in METADATA_KEYS if key not in meta]
         assert not missing, f"metadata 缺少键 {missing}，实际 {sorted(meta)}"
         assert meta["roi_xywh"] == (32, 32, 176, 176), f"ROI 回显失真：{meta['roi_xywh']}"
+        assert detector_tuple(meta) == (128, 30.0, 60.0), \
+            f"默认参 metadata 三值未物化：{detector_tuple(meta)} 应为 (128,30,60)"
+        assert segment_detector(first_fine_segment(data)) == (128, 30.0, 60.0), \
+            f"默认参首段序列化漂移：{segment_detector(first_fine_segment(data))} 应为 (128,30,60)"
         hits = model.match(reference, threshold=60)
         assert len(hits) >= 1, f"同图匹配命中 {len(hits)} 应 ≥1"
         best = max(hits, key=lambda candidate: candidate.score)
@@ -188,6 +240,50 @@ def group_detector_roundtrip() -> None:
             f"容器重导出首段参数漂移：{recontainer} 应为 {expected}"
 
 
+def group_container_tamper() -> None:
+    reference = synth_reference()
+    container = train_custom(reference)
+    parts = split_container(container)
+    png_index = len(parts) - 2
+
+    def png_replaced(png: bytes) -> bytes:
+        replaced = list(parts)
+        replaced[png_index] = png
+        return rebuild_container(replaced)
+
+    def set_cfg(index: int, value):
+        def apply(meta: dict) -> None:
+            meta["cfg"][index] = value
+        return apply
+
+    def narrow_angle(meta: dict) -> None:
+        meta["cfg"][5] = 10
+
+    expect_load_reject(with_meta(parts, lambda meta: meta.update(k=4)),
+                       "coarse segment disagrees with reference scale", "k 改档")
+    expect_load_reject(with_meta(parts, set_cfg(2, 175)),
+                       "template image disagrees with original training ROI", "ROI 宽度改写")
+    expect_load_reject(png_replaced(make_png(4097, 24)),
+                       "template image header exceeds edge budget", "PNG 4097 超边长")
+    expect_load_reject(with_meta(parts, set_cfg(0, 0)),
+                       "fine segment disagrees with original training ROI", "ROI 原点改写")
+    expect_load_reject(with_meta(parts, lambda meta: meta.update(groups=[[60, 60]])),
+                       "fine segment angle range disagrees with group metadata", "组界改写")
+    expect_load_reject(with_meta(parts, lambda meta: meta.update(ref=[321, 320])),
+                       "fine segment disagrees with reference size", "参考尺寸改写")
+    expect_load_reject(with_meta(parts, set_cfg(10, 0)),
+                       "persisted detector thresholds must be positive", "持久化零阈值")
+    expect_load_reject(with_meta(split_container(train_defaults(reference)), narrow_angle),
+                       "group angle range outside original training range", "角度改窄")
+    try:
+        NativeModel(png_replaced(make_png(4096, 24)))
+        raise AssertionError("PNG 4096 控件预期通过头部预检后在 ROI 一致性被拒，实际被接受")
+    except NativeShapeError as exc:
+        text = str(exc)
+        assert "disagrees with original training ROI" in text and "header exceeds" not in text, \
+            f"PNG 4096 控件拒绝位置不符：{exc!r}"
+
+
 def group_batch_mix() -> None:
     reference = synth_reference()
     two_bytes = train_defaults(reference)
@@ -231,6 +327,7 @@ GROUPS = [
     ("py_full_chain", group_full_chain),
     ("py_metadata_roundtrip", group_metadata_roundtrip),
     ("py_detector_roundtrip", group_detector_roundtrip),
+    ("py_container_tamper", group_container_tamper),
     ("py_batch_mix", group_batch_mix),
     ("py_lifecycle", group_lifecycle),
 ]

@@ -33,6 +33,21 @@ void write_u64(std::vector<uint8_t>& out, uint64_t v) {
     for (int i = 0; i < 8; ++i) out.push_back(uint8_t((v >> (8 * i)) & 0xFF));
 }
 
+// F09 解码前置边界：PNG 头预检在 imdecode 之前——8 字节签名 + 首块 IHDR 的
+// 宽/高（u32 BE，偏移 16/20）。边 >4096 在解码分配发生前拒绝，限制解码阶段
+// 内存峰值而非解码后补救；非 PNG 字节不在此拒（交由 imdecode 判空走原路径）
+void require_png_edges(const std::vector<uint8_t>& png) {
+    static const uint8_t signature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    if (png.size() < 24 || std::memcmp(png.data(), signature, sizeof(signature)) != 0) return;
+    if (std::memcmp(png.data() + 12, "IHDR", 4) != 0) return;  // 非法规头交 imdecode 拒
+    auto u32_be = [&png](size_t off) {
+        return (uint64_t(png[off]) << 24) | (uint64_t(png[off + 1]) << 16) |
+               (uint64_t(png[off + 2]) << 8) | uint64_t(png[off + 3]);
+    };
+    require(u32_be(16) <= uint64_t(max_edge) && u32_be(20) <= uint64_t(max_edge),
+            "template image header exceeds edge budget");
+}
+
 struct Meta {
     int k = 8;
     std::vector<GroupSpec> groups;
@@ -176,22 +191,22 @@ void measure_bias(Model& model, const cv::Mat& image_bgr,
     } else {
         target = patch;
     }
-    try {
-        auto cands = match(model, target, 50.0);
-        require(!cands.empty(), "anchor calibration found no candidates");
-        const auto& best = *std::max_element(
-            cands.begin(), cands.end(),
-            [](const vf_shape_candidate& a, const vf_shape_candidate& b) {
-                return a.score < b.score;
-            });
-        *bx = best.center[0] - pcx;
-        *by = best.center[1] - pcy;
-    } catch (const std::exception&) {
-        // 降级语义：锚点校准依赖 ROI 自匹配，低对比场景落空是预期路径，
-        // 回退零偏置不算错误；只收窄捕获标准异常，其余穿透训练报错
+    // F06 去异常化：无 try/catch。空候选本身是预期降级信号（零偏置）；
+    // 真异常（bad_alloc/OpenCV 运行时/预算合同）自然穿透训练报错
+    auto cands = match(model, target, 50.0);
+    if (cands.empty()) {
+        // 降级语义：锚点校准依赖 ROI 自匹配，低对比/弱特征场景落空是预期路径
         *bx = 0;
         *by = 0;
+        return;
     }
+    const auto& best = *std::max_element(
+        cands.begin(), cands.end(),
+        [](const vf_shape_candidate& a, const vf_shape_candidate& b) {
+            return a.score < b.score;
+        });
+    *bx = best.center[0] - pcx;
+    *by = best.center[1] - pcy;
 }
 
 }  // namespace
@@ -213,6 +228,13 @@ std::shared_ptr<TwoStageModel> train_two_stage(
 
     auto model = std::make_shared<TwoStageModel>();
     model->base_config = config;
+    // R01 对齐：cfg 三参持久化实际生效值（默认零在训练侧物化），与单级 codec
+    // 的回填同口径——新容器不携带零字段，解码侧按持久化值严格校验不再冲突
+    const auto tuned = validate_detector_params(config.feature_count, config.weak_th,
+                                                config.strong_th);
+    model->base_config.feature_count = tuned.features;
+    model->base_config.weak_th = tuned.weak;
+    model->base_config.strong_th = tuned.strong;
     model->ref_width = w;   // F01：原始参考图尺寸（容器 ref 键）
     model->ref_height = h;
     model->groups.resize(n_groups);
@@ -277,8 +299,10 @@ std::shared_ptr<TwoStageModel> train_two_stage(
             model->k = k;
             coarse_ok = true;
             break;
-        } catch (const std::exception& ex) {
-            // 各档留真实失败原因供全部失败时上抛，不再统一改写文案
+        } catch (const std::invalid_argument& ex) {
+            // F06 异常精确分类：仅输入合同类失败（require 抛 invalid_argument：
+            // 特征不足/几何/预算）可换档重试，各档留真实失败原因；
+            // bad_alloc/OpenCV 运行时等其他异常立即重抛穿透，不吞成"换档可解决"
             coarse_failure = "K=" + std::to_string(k) + ": " + ex.what();
         }
     }
@@ -303,18 +327,25 @@ std::shared_ptr<TwoStageModel> train_two_stage(
 // —— 容器编解码 ——
 std::vector<uint8_t> encode_two_stage(const TwoStageModel& model) {
     // 段：fines 导出 bytes ×n + coarse + tmpl_png + meta
+    // F09：增量预算——每生成一段即累计，中途超 32MiB 立即抛（不等全部段生成
+    // 完，缩短超限模型的编码期驻留）；合同与 decode 侧同一口径
+    uint64_t total = kMagicLen + kLenWidth * (uint64_t(model.fines.size()) + 4);
+    auto accrue = [&total](uint64_t bytes) {
+        total += bytes;
+        require(total <= max_model_bytes, "model container exceeds size budget");
+    };
     std::vector<std::vector<uint8_t>> fines_bytes;
-    for (auto& f : model.fines) fines_bytes.push_back(encode(*f));
+    for (auto& f : model.fines) {
+        fines_bytes.push_back(encode(*f));
+        accrue(fines_bytes.back().size());
+    }
     std::vector<uint8_t> coarse_bytes = encode(*model.coarse);
+    accrue(coarse_bytes.size());
     std::vector<uint8_t> tmpl_bytes;
     cv::imencode(".png", model.tmpl_gray, tmpl_bytes);
+    accrue(tmpl_bytes.size());
     const std::string meta = dump_meta(model);
-
-    // F09：容器总量提前封口（与 decode 侧同一 32MiB 合同，防"导出成功、加载被拒"）
-    uint64_t total = kMagicLen + kLenWidth * (uint64_t(model.fines.size()) + 4);
-    for (const auto& b : fines_bytes) total += b.size();
-    total += uint64_t(coarse_bytes.size()) + uint64_t(tmpl_bytes.size()) + uint64_t(meta.size());
-    require(total <= max_model_bytes, "model container exceeds size budget");
+    accrue(meta.size());
 
     std::vector<uint8_t> out(kMagic, kMagic + kMagicLen);
     write_u64(out, model.fines.size());
@@ -355,6 +386,7 @@ std::shared_ptr<TwoStageModel> decode_two_stage(const uint8_t* bytes, uint64_t s
     for (uint64_t i = 0; i < n; ++i)
         model->fines.push_back(decode(parts[i].data(), parts[i].size()));
     model->coarse = decode(parts[n].data(), parts[n].size());
+    require_png_edges(parts[n + 1]);  // F09：先于 imdecode 的边长合同（内存峰值前置）
     model->tmpl_gray = cv::imdecode(parts[n + 1], cv::IMREAD_GRAYSCALE);
     if (model->tmpl_gray.empty()) return nullptr;
     const Meta meta = parse_meta(std::string(parts[n + 2].begin(), parts[n + 2].end()));
@@ -375,6 +407,10 @@ std::shared_ptr<TwoStageModel> decode_two_stage(const uint8_t* bytes, uint64_t s
                 "inconsistent fine-group reference geometry");
     if (meta.has_cfg) {
         // F01：原始配置恢复 + F09 新容器强校验（ROI 对 tmpl、coarse 对 k 缩放关系）
+        // R01 连带：cfg 三参是持久化实际值，先于 validate_config 严格校验——
+        // 零/损坏须拒绝（与单级 codec 同口径），不得经训练零值默认语义洗白
+        validate_persisted_detector_params(meta.cfg.feature_count, meta.cfg.weak_th,
+                                           meta.cfg.strong_th);
         validate_config(meta.cfg, meta.ref_w, meta.ref_h);
         require(model->tmpl_gray.cols == meta.cfg.roi_width &&
                     model->tmpl_gray.rows == meta.cfg.roi_height,
@@ -382,6 +418,31 @@ std::shared_ptr<TwoStageModel> decode_two_stage(const uint8_t* bytes, uint64_t s
         require(model->coarse->width == std::max(24, meta.ref_w / model->k) &&
                     model->coarse->height == std::max(24, meta.ref_h / model->k),
                 "coarse segment disagrees with reference scale");
+        // F09 跨段补核：fine 与 meta 的参考尺寸/ROI 原点/角度组逐项对齐（防
+        // 各段互不相关的拼接容器）。角度容差 1e-9：段内 double 位级写读、
+        // meta 17 位十进制往返均精确，1e-9 仅为防御性余量（实测差为 0）
+        for (size_t i = 0; i < model->fines.size(); ++i) {
+            const auto& fine = *model->fines[i];
+            require(fine.width == meta.ref_w && fine.height == meta.ref_h,
+                    "fine segment disagrees with reference size");
+            require(fine.config.roi_x == meta.cfg.roi_x && fine.config.roi_y == meta.cfg.roi_y &&
+                        fine.config.roi_width == meta.cfg.roi_width &&
+                        fine.config.roi_height == meta.cfg.roi_height,
+                    "fine segment disagrees with original training ROI");
+            require(std::abs(fine.config.angle_min - model->groups[i].lo) <= 1e-9 &&
+                        std::abs(fine.config.angle_max - model->groups[i].hi) <= 1e-9,
+                    "fine segment angle range disagrees with group metadata");
+            require(model->groups[i].lo >= meta.cfg.angle_min - 1e-9 &&
+                        model->groups[i].hi <= meta.cfg.angle_max + 1e-9,
+                    "group angle range outside original training range");
+            // 三参一致性：fine 段解码回填的是 float 域实际生效值，cfg 为原样
+            // double；在 float 域比较（两者均经同一 float 量化，非 float 级
+            // 差异即为篡改/拼接）
+            require(static_cast<float>(meta.cfg.weak_th) == fine.config.weak_th &&
+                        static_cast<float>(meta.cfg.strong_th) == fine.config.strong_th &&
+                        meta.cfg.feature_count == fine.config.feature_count,
+                    "fine segment detector parameters disagree with original config");
+        }
         model->base_config = meta.cfg;
         model->ref_width = meta.ref_w;
         model->ref_height = meta.ref_h;
@@ -465,7 +526,7 @@ bool same_object(const vf_shape_candidate& a, const vf_shape_candidate& b) {
 constexpr double kAmbiguityScoreGap = 10.;
 
 // 多目标搜索预算：粗候选按分数保留上限 / 精修窗调度上限。前两窗恒跑（保
-// 双目标），其余窗串行补搜索并在累计精修结果达 max_candidates 后早停
+// 双目标），其余窗串行补搜索并在达标去重候选数达 max_candidates 后早停
 constexpr size_t kMaxCoarseCandidates = 16;
 constexpr size_t kMaxFineWindows = 8;
 
@@ -519,7 +580,7 @@ std::vector<vf_shape_candidate> match_two_stage(
     if (coarse_cands.size() > kMaxCoarseCandidates)
         coarse_cands.resize(kMaxCoarseCandidates);
     // 前两窗恒跑（Codex P1 教训：分差启发在双目标场景丢第二目标）；
-    // 其余窗补足多目标覆盖，累计精修结果达 max_candidates 早停
+    // 其余窗补足多目标覆盖，达标去重候选数达 max_candidates 早停
     const size_t use = std::min<size_t>(kMaxFineWindows, coarse_cands.size());
     profile.count = int(use);
 
@@ -624,6 +685,24 @@ std::vector<vf_shape_candidate> match_two_stage(
         return window_results;
     };
     std::vector<vf_shape_candidate> results;
+    // F08：早停口径与最终输出对齐——只计 score≥threshold 且互不重叠（聚类同
+    // 口径 IoU>0.4 去重）的候选。原判据用聚类与阈值过滤前的原始累计数：重复
+    // 或低分候选会提前耗满预算，截断后续补搜索窗（同一目标被多窗命中时尤为
+    // 明显——原始数达标、聚类后不足，广义覆盖缺口）
+    auto qualified_objects = [&results, threshold]() {
+        std::vector<const vf_shape_candidate*> kept;
+        for (const auto& c : results) {
+            if (c.score < threshold) continue;
+            bool duplicate = false;
+            for (const auto* k : kept)
+                if (same_object(*k, c)) {
+                    duplicate = true;
+                    break;
+                }
+            if (!duplicate) kept.push_back(&c);
+        }
+        return kept.size();
+    };
     {
     MatchProfile::Timer window_timer(profile.windows_ms);
 #ifdef VF_SHAPE_PARALLEL_WINDOWS
@@ -634,12 +713,12 @@ std::vector<vf_shape_candidate> match_two_stage(
         auto candidates = second.get();
         results.insert(results.end(), candidates.begin(), candidates.end());
     }
-    for (size_t ci = 2; ci < use && results.size() < size_t(max_candidates); ++ci) {
+    for (size_t ci = 2; ci < use && qualified_objects() < size_t(max_candidates); ++ci) {
         auto candidates = refine_window(ci);
         results.insert(results.end(), candidates.begin(), candidates.end());
     }
 #else
-    for (size_t ci = 0; ci < use && (ci < 2 || results.size() < size_t(max_candidates)); ++ci) {
+    for (size_t ci = 0; ci < use && (ci < 2 || qualified_objects() < size_t(max_candidates)); ++ci) {
         auto candidates = refine_window(ci);
         results.insert(results.end(), candidates.begin(), candidates.end());
     }

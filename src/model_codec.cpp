@@ -4,6 +4,8 @@
 #include <limits>
 
 namespace vfshape {
+// 定义于 matcher.cpp：持久化侧严格校验，与训练侧 validate_detector_params 的零默认语义区分
+DetectorTuning validate_persisted_detector_params(int features, double weak, double strong);
 namespace {
 constexpr char signature[] = "VFSHAPE1:3df935f8e4b8c8a8ed72984211543e1b7696452e:p3";
 class Writer {
@@ -103,7 +105,7 @@ std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size) {
     validate_config(config, dec_width, dec_height);
     const int dec_features = in.bounded(16, max_features_per_level);
     const double dec_weak = in.number(), dec_strong = in.number();
-    const auto tuning = validate_detector_params(dec_features, dec_weak, dec_strong);
+    const auto tuning = validate_persisted_detector_params(dec_features, dec_weak, dec_strong);
     auto model = std::make_shared<Model>(tuning.features, tuning.weak, tuning.strong);
     model->width = dec_width; model->height = dec_height; model->config = config;
     // 回填实际生效三参：metadata 与二次导出的稳定来源（零值不再表示默认）

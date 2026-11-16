@@ -50,7 +50,26 @@ DetectorTuning validate_detector_params(int features, double weak, double strong
     require(w <= s, "weak threshold must not exceed strong threshold");
     require(s <= kMaxStrongThreshold, "strong threshold exceeds reachable gradient magnitude (1020)");
     require(f >= 16 && f <= max_features_per_level, "feature count per level must be 16-512");
-    return {f, float(w), float(s)};
+    // 训练入口同样防 float 下溢：极小正值转 float 归零会产出导出后无法加载的资产
+    //（训练侧归一化零=默认合法，但下溢拒绝与持久化侧口径一致）
+    const float fw = float(w), fs = float(s);
+    require(std::isfinite(fw) && std::isfinite(fs) && fw > 0 && fs > 0,
+            "detector thresholds not representable as positive float");
+    return {f, fw, fs};
+}
+
+// 与训练侧语义相反：序列化字段是实际生效值，零=损坏须拒绝而非默认化；并防
+// double→float 下溢（极小正值转 float 归零）导致接受后再加载被默认化洗值。
+DetectorTuning validate_persisted_detector_params(int features, double weak, double strong) {
+    require(std::isfinite(weak) && std::isfinite(strong), "detector thresholds must be finite");
+    require(weak > 0 && strong > 0, "persisted detector thresholds must be positive");
+    require(weak <= strong, "weak threshold must not exceed strong threshold");
+    require(strong <= kMaxStrongThreshold, "strong threshold exceeds reachable gradient magnitude (1020)");
+    require(features >= 16 && features <= max_features_per_level, "feature count per level must be 16-512");
+    const float fw = static_cast<float>(weak), fs = static_cast<float>(strong);
+    require(std::isfinite(fw) && std::isfinite(fs) && fw > 0 && fs > 0,
+            "detector thresholds not representable as positive float");
+    return {features, fw, fs};
 }
 
 void validate_config(const vf_shape_train_config& c, int width, int height) {
