@@ -18,9 +18,15 @@ DETECTOR_TUPLE_BYTES = 20
 
 
 def split_container(container: bytes) -> list[bytes]:
-    if container[:5] != MAGIC:
-        raise ValueError("不是两级容器格式（VF2S3）")
+    # 长度/段数预算前置：损坏输入（如 b"VF2S3" 截断）必须在 unpack 前拒绝，
+    # struct.error 属程序缺陷信号，不允许漏到 CLI 顶层变裸 traceback
+    if len(container) < 13 or container[:5] != MAGIC:
+        raise ValueError("不是两级容器格式（VF2S3）或长度不足")
     count = struct.unpack_from("<Q", container, 5)[0]
+    if not 1 <= count <= 64:
+        raise ValueError("容器段数非法")
+    if len(container) < 13 + 8 * (count + 3):
+        raise ValueError("段表长度超出容器，容器已损坏")
     lengths = struct.unpack_from("<" + "Q" * (count + 3), container, 13)
     parts, offset = [], 13 + 8 * (count + 3)
     for length in lengths:
@@ -29,7 +35,7 @@ def split_container(container: bytes) -> list[bytes]:
             raise ValueError("段表长度超出容器，容器已损坏")
         parts.append(container[offset:end])
         offset = end
-    if count < 1 or len(parts) != count + 3:
+    if len(parts) != count + 3:
         raise ValueError("容器段数非法")
     return parts
 
@@ -83,7 +89,7 @@ def main(argv: list[str]) -> int:
         return 2
     try:
         parts = split_container(container)
-    except ValueError as exc:
+    except (ValueError, struct.error) as exc:
         print(f"{exc}；单级旧格式不受零 cfg 收紧影响，无需迁移。", file=sys.stderr)
         return 1
     try:

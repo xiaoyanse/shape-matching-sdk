@@ -335,7 +335,8 @@ def group_zero_cfg_migration() -> None:
         assert result.returncode == 1, \
             f"零 cfg 且 fine 段三参不一致应退出 1：rc={result.returncode} {result.stdout.strip()}"
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        # 回收失败须显式报错并使门禁失败（路径随异常抛出），不静默吞掉
+        shutil.rmtree(workspace)
 
 
 def group_batch_mix() -> None:

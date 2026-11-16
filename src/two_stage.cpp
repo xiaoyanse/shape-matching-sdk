@@ -560,6 +560,19 @@ std::vector<vf_shape_candidate> cluster_candidates(std::vector<vf_shape_candidat
     }
     return objects;
 }
+
+// 早停计数与最终输出口径的单一实现（F08）：对候选集副本执行与收尾路径
+// 完全相同的序列（分数降序排序→聚类→计过阈值数）。具名供见证测试
+// 构造级对拍（tests/witness_test.cpp 直调）——勿在别处另行实现计数。
+size_t count_qualified_objects(std::vector<vf_shape_candidate> candidates, double threshold) {
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) { return a.score > b.score; });
+    candidates = cluster_candidates(std::move(candidates));
+    return size_t(std::count_if(candidates.begin(), candidates.end(),
+                                [threshold](const vf_shape_candidate& c) {
+                                    return c.score >= threshold;
+                                }));
+}
 }  // namespace
 
 // —— 两级匹配（Python TwoStageMatcher._match_locked 对齐）——
@@ -690,19 +703,10 @@ std::vector<vf_shape_candidate> match_two_stage(
         return window_results;
     };
     std::vector<vf_shape_candidate> results;
-    // F08：早停口径与最终输出构造级一致——对 results 副本执行与最终路径完全
-    // 相同的序列（分数降序排序→cluster_candidates→阈值判据）。同代码路径保
-    // 证口径一致：IoU 非传递使任何单独实现的去重计数（如插入序贪心）都与
-    // 排序后聚类不等价，勿在此另行实现计数
+    // F08：早停计数走 count_qualified_objects（与收尾路径同代码序列的具名
+    // 单一实现）；IoU 非传递使任何单独实现的去重计数都与排序聚类不等价
     auto qualified_objects = [&results, threshold]() {
-        std::vector<vf_shape_candidate> snapshot = results;
-        std::sort(snapshot.begin(), snapshot.end(),
-                  [](const auto& a, const auto& b) { return a.score > b.score; });
-        snapshot = cluster_candidates(std::move(snapshot));
-        return size_t(std::count_if(snapshot.begin(), snapshot.end(),
-                                    [threshold](const vf_shape_candidate& c) {
-                                        return c.score >= threshold;
-                                    }));
+        return count_qualified_objects(results, threshold);
     };
     {
     MatchProfile::Timer window_timer(profile.windows_ms);

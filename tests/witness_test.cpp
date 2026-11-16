@@ -24,15 +24,10 @@ vf_shape_candidate box(double x, double score) {
     return c;
 }
 
-// 与 match_two_stage 早停闭包/收尾路径逐字一致的口径
-size_t early_stop_count(std::vector<vf_shape_candidate> sequence, double threshold) {
-    std::sort(sequence.begin(), sequence.end(),
-              [](const auto& a, const auto& b) { return a.score > b.score; });
-    auto clustered = vfshape::cluster_candidates(std::move(sequence));
-    return size_t(std::count_if(clustered.begin(), clustered.end(),
-                                [threshold](const vf_shape_candidate& c) {
-                                    return c.score >= threshold;
-                                }));
+// 生产早停口径的直连：two_stage.cpp 具名函数 count_qualified_objects（本 TU
+// 已编入其源码）——见证必须咬住生产代码本身，不是转录副本
+size_t early_stop_count(const std::vector<vf_shape_candidate>& sequence, double threshold) {
+    return vfshape::count_qualified_objects(sequence, threshold);
 }
 
 size_t final_count(std::vector<vf_shape_candidate> sequence, double threshold) {
