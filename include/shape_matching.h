@@ -17,7 +17,8 @@ extern "C" {
  * 构建清单 runtime-manifest.json 的 sdk_version 字段声明，不与 ABI 数值
  * 强制相等。
  *
- * 错误分层（全部函数统一）：
+ * 错误分层（除 vf_shape_abi_version 外统一：该入口返回 ABI 版本号本身，
+ * 无失败路径，不适用 0/1/2 约定）：
  * - 返回 0：成功。仅此时允许消费输出参数（句柄、count、config、size）。
  * - 返回 1：可报告失败（std::exception 族：参数非法、资源超限、解码失败等）。
  * - 返回 2：未分类原生失败。非 0 时的错误文本是尽力诊断信息，不构成
@@ -34,7 +35,9 @@ extern "C" {
  *
  * 并发：
  * - 同一句柄上的调用由库串行化；不同句柄可并行调用。
- * - 与在途调用并发 close 安全：在途调用正常完成，句柄自此失效。
+ * - 与在途调用并发 close 不产生悬垂访问等内存安全问题（模型寿命由内部
+ *   所有权维持），但竞态中的在途调用可能以"句柄已关闭或未知"类错误
+ *   返回 1：寿命安全不等于该调用业务成功，句柄自此失效。
  * - 匹配/训练期间库（含内部并行窗口）只读访问输入图像；调用返回之前
  *   调用方不得改写图像缓冲。
  *
@@ -154,7 +157,10 @@ VF_SHAPE_API int32_t vf_shape_close(uint64_t handle, char* error, uint32_t error
 /* 同一输入帧对多个模型匹配。item_count 须在 1..16，item_size 必须等于
  * sizeof(vf_shape_batch_item)。返回 0 仅表示批量流程完成，每个条目的
  * status 须单独检查；库先把全部条目的 count 置零、status 置 1、error 清空，
- * 再逐项执行。仅当 items 为空、条数或条目尺寸不符时整体返回非 0。 */
+ * 再逐项执行。调用方必须先检查整体返回码、仅当为 0 时再消费逐项结果：
+ * 除 items 为空、条数或条目尺寸不符外，公共图像校验失败与批量编排级
+ * 资源异常（如缓冲分配失败）同样使整体返回非 0，此时逐项 status 只是
+ * 初始化状态，不构成完整结果。 */
 VF_SHAPE_API int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_size,
     int32_t width, int32_t height, uint64_t stride, vf_shape_batch_item* items,
     uint32_t item_count, uint32_t item_size, char* error, uint32_t error_capacity);

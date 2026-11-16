@@ -10,9 +10,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
 from ctypes import byref, c_uint64, create_string_buffer
 from pathlib import Path
@@ -21,13 +23,19 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 OPENCV_BIN = Path(os.environ.get("SHAPE_SDK_OPENCV_BIN", "C:/opencv/build/x64/vc16/bin"))
-BUILD_DLLS = (
-    ROOT / "build" / "tD2" / "Release" / "visionforge_shape.dll",
-    ROOT / "build" / "tD2" / "visionforge_shape.dll",
-    ROOT / "build" / "tD" / "Release" / "visionforge_shape.dll",
-    ROOT / "build" / "tD" / "visionforge_shape.dll",
-)
 DIST_MANIFEST = ROOT / "dist" / "runtime" / "runtime-manifest.json"
+
+
+def latest_build_dll() -> Path | None:
+    """出口门构建目录（build/tD*）按版本号降序发现最新 DLL。"""
+    directories = sorted(((ROOT / "build").glob("tD*")),
+                         key=lambda path: (len(path.name), path.name), reverse=True)
+    for directory in directories:
+        for name in ("Release/visionforge_shape.dll", "visionforge_shape.dll"):
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+    return None
 METADATA_KEYS = (
     "reference_width", "reference_height", "roi_xywh",
     "angle_min", "angle_max", "angle_step", "scale_min", "scale_max", "scale_step",
@@ -37,7 +45,7 @@ METADATA_KEYS = (
 
 def assemble_runtime() -> None:
     """构建 DLL 与根 dist 清单不一致时自装配 build/tD/runtime（不写根 dist）。"""
-    built = next((path for path in BUILD_DLLS if path.is_file()), None)
+    built = latest_build_dll()
     if built is None:
         return
     build_root = built.parents[1]
@@ -284,6 +292,52 @@ def group_container_tamper() -> None:
             f"PNG 4096 控件拒绝位置不符：{exc!r}"
 
 
+def group_zero_cfg_migration() -> None:
+    reference = synth_reference()
+    zero_container = with_meta(split_container(train_defaults(reference)),
+                               lambda meta: meta["cfg"].__setitem__(slice(10, 13), [0, 0, 0]))
+    expect_load_reject(zero_container, "persisted detector thresholds must be positive",
+                       "零 cfg 容器应被当前版本拒绝")
+
+    workspace = Path(tempfile.mkdtemp(prefix="zero_cfg_migration_"))
+    try:
+        source = workspace / "legacy.bin"
+        source.write_bytes(zero_container)
+        migrated = workspace / "migrated.bin"
+        script = ROOT / "scripts" / "migrate_zero_cfg.py"
+        result = subprocess.run([sys.executable, "-B", str(script), str(source), str(migrated)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, \
+            f"迁移脚本退出码 {result.returncode}：{result.stderr.strip() or result.stdout.strip()}"
+        recovered = migrated.read_bytes()
+        with NativeModel(recovered) as model:
+            actual = detector_tuple(model.metadata)
+            assert actual == (128, 30.0, 60.0), \
+                f"迁移后 metadata 三参不符：{actual} 应为 (128,30,60)"
+        idempotent = workspace / "migrated2.bin"
+        result = subprocess.run(
+            [sys.executable, "-B", str(script), str(migrated), str(idempotent)],
+            capture_output=True, text=True)
+        assert result.returncode == 0 and idempotent.read_bytes() == recovered, \
+            f"重复迁移应幂等输出一致字节：rc={result.returncode} {result.stderr.strip()}"
+
+        tampered_parts = split_container(zero_container)
+        detector_at = tampered_parts[1].index(b"\0") + 1 + 12 + 64
+        divergent = bytearray(tampered_parts[1])
+        struct.pack_into("<dd", divergent, detector_at + 4, 20.0, 40.0)
+        tampered_parts[1] = bytes(divergent)
+        divergent_file = workspace / "divergent.bin"
+        divergent_file.write_bytes(rebuild_container(tampered_parts))
+        divergent_out = workspace / "divergent_out.bin"
+        result = subprocess.run(
+            [sys.executable, "-B", str(script), str(divergent_file), str(divergent_out)],
+            capture_output=True, text=True)
+        assert result.returncode == 1, \
+            f"零 cfg 且 fine 段三参不一致应退出 1：rc={result.returncode} {result.stdout.strip()}"
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def group_batch_mix() -> None:
     reference = synth_reference()
     two_bytes = train_defaults(reference)
@@ -328,6 +382,7 @@ GROUPS = [
     ("py_metadata_roundtrip", group_metadata_roundtrip),
     ("py_detector_roundtrip", group_detector_roundtrip),
     ("py_container_tamper", group_container_tamper),
+    ("py_zero_cfg_migration", group_zero_cfg_migration),
     ("py_batch_mix", group_batch_mix),
     ("py_lifecycle", group_lifecycle),
 ]

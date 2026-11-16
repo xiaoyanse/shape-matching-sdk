@@ -136,4 +136,15 @@ $manifest = [ordered]@{
 # ConvertTo-Json 多行输出为 CRLF，统一 LF，避免消费方哈希链被行尾改写打断。
 $json = ($manifest | ConvertTo-Json -Depth 4) -replace "`r`n", "`n"
 [System.IO.File]::WriteAllText((Join-Path $runtimeDir 'runtime-manifest.json'), $json + "`n", [System.Text.UTF8Encoding]::new($false))
+if ($BuildTests) {
+    # Python 主链门禁以本批刚装配的 dist/runtime 为唯一测试对象，显式指定，
+    # 覆盖调用方环境残留的 SHAPE_SDK_RUNTIME；-SkipAssemble 时不具备被测对象，不进入本分支。
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) { throw 'Python 主链门禁需要 python（含 numpy），未在 PATH 找到 python' }
+    & $python.Source -c "import numpy"
+    if ($LASTEXITCODE -ne 0) { throw 'Python 主链门禁依赖 numpy 未满足（绑定声明 numpy>=2,<3），环境未按契约准备' }
+    $env:SHAPE_SDK_RUNTIME = $runtimeDir
+    & $python.Source -B (Join-Path $sourceDir 'scripts/test_main_chain.py')
+    if ($LASTEXITCODE -ne 0) { throw 'Python 主链回归失败' }
+}
 Write-Host "原生组件已构建并装配：$runtimeDir"

@@ -33,13 +33,18 @@ void write_u64(std::vector<uint8_t>& out, uint64_t v) {
     for (int i = 0; i < 8; ++i) out.push_back(uint8_t((v >> (8 * i)) & 0xFF));
 }
 
-// F09 解码前置边界：PNG 头预检在 imdecode 之前——8 字节签名 + 首块 IHDR 的
-// 宽/高（u32 BE，偏移 16/20）。边 >4096 在解码分配发生前拒绝，限制解码阶段
-// 内存峰值而非解码后补救；非 PNG 字节不在此拒（交由 imdecode 判空走原路径）
-void require_png_edges(const std::vector<uint8_t>& png) {
+// F09 模板段格式合同=仅 PNG：本方编码器只产 PNG（encode_two_stage 用
+// cv::imencode(".png")），收紧无合法资产受损。imdecode 还可解 BMP/PGM/JPEG
+// 等，若放行非 PNG 字节，尺寸限制退化为解码后补救、解码分配无界——故不足
+// 24 字节/签名不符/首块非 IHDR/宽或高（u32 BE，偏移 16/20）>4096 一律在
+// 解码前拒绝。文案统一 "template image header ..." 系，与解码后检查可区分
+void require_png_template(const std::vector<uint8_t>& png) {
     static const uint8_t signature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
-    if (png.size() < 24 || std::memcmp(png.data(), signature, sizeof(signature)) != 0) return;
-    if (std::memcmp(png.data() + 12, "IHDR", 4) != 0) return;  // 非法规头交 imdecode 拒
+    require(png.size() >= 24, "template image header too short for PNG");
+    require(std::memcmp(png.data(), signature, sizeof(signature)) == 0,
+            "template image header signature is not PNG");
+    require(std::memcmp(png.data() + 12, "IHDR", 4) == 0,
+            "template image header first chunk is not IHDR");
     auto u32_be = [&png](size_t off) {
         return (uint64_t(png[off]) << 24) | (uint64_t(png[off + 1]) << 16) |
                (uint64_t(png[off + 2]) << 8) | uint64_t(png[off + 3]);
@@ -386,7 +391,7 @@ std::shared_ptr<TwoStageModel> decode_two_stage(const uint8_t* bytes, uint64_t s
     for (uint64_t i = 0; i < n; ++i)
         model->fines.push_back(decode(parts[i].data(), parts[i].size()));
     model->coarse = decode(parts[n].data(), parts[n].size());
-    require_png_edges(parts[n + 1]);  // F09：先于 imdecode 的边长合同（内存峰值前置）
+    require_png_template(parts[n + 1]);  // F09：先于 imdecode 的 PNG 格式+边长合同（内存峰值前置）
     model->tmpl_gray = cv::imdecode(parts[n + 1], cv::IMREAD_GRAYSCALE);
     if (model->tmpl_gray.empty()) return nullptr;
     const Meta meta = parse_meta(std::string(parts[n + 2].begin(), parts[n + 2].end()));
@@ -685,23 +690,19 @@ std::vector<vf_shape_candidate> match_two_stage(
         return window_results;
     };
     std::vector<vf_shape_candidate> results;
-    // F08：早停口径与最终输出对齐——只计 score≥threshold 且互不重叠（聚类同
-    // 口径 IoU>0.4 去重）的候选。原判据用聚类与阈值过滤前的原始累计数：重复
-    // 或低分候选会提前耗满预算，截断后续补搜索窗（同一目标被多窗命中时尤为
-    // 明显——原始数达标、聚类后不足，广义覆盖缺口）
+    // F08：早停口径与最终输出构造级一致——对 results 副本执行与最终路径完全
+    // 相同的序列（分数降序排序→cluster_candidates→阈值判据）。同代码路径保
+    // 证口径一致：IoU 非传递使任何单独实现的去重计数（如插入序贪心）都与
+    // 排序后聚类不等价，勿在此另行实现计数
     auto qualified_objects = [&results, threshold]() {
-        std::vector<const vf_shape_candidate*> kept;
-        for (const auto& c : results) {
-            if (c.score < threshold) continue;
-            bool duplicate = false;
-            for (const auto* k : kept)
-                if (same_object(*k, c)) {
-                    duplicate = true;
-                    break;
-                }
-            if (!duplicate) kept.push_back(&c);
-        }
-        return kept.size();
+        std::vector<vf_shape_candidate> snapshot = results;
+        std::sort(snapshot.begin(), snapshot.end(),
+                  [](const auto& a, const auto& b) { return a.score > b.score; });
+        snapshot = cluster_candidates(std::move(snapshot));
+        return size_t(std::count_if(snapshot.begin(), snapshot.end(),
+                                    [threshold](const vf_shape_candidate& c) {
+                                        return c.score >= threshold;
+                                    }));
     };
     {
     MatchProfile::Timer window_timer(profile.windows_ms);

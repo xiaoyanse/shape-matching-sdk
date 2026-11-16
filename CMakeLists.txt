@@ -84,4 +84,14 @@ if(VF_SHAPE_BUILD_TESTS)
         target_compile_options(shape_abi_tamper_test PRIVATE /utf-8 /EHsc)
     endif()
     add_test(NAME shape_abi_tamper COMMAND shape_abi_tamper_test)
+    add_executable(shape_witness_test tests/witness_test.cpp src/matcher.cpp
+        src/model_codec.cpp src/coarse_image.cpp src/geometric_refinement.cpp
+        vendor/shape_based_matching/line2Dup.cpp)
+    target_include_directories(shape_witness_test PRIVATE include src ${OpenCV_INCLUDE_DIRS}
+        vendor/shape_based_matching vendor/shape_based_matching/MIPP)
+    target_link_libraries(shape_witness_test PRIVATE ${OpenCV_LIBS} Threads::Threads)
+    if(MSVC)
+        target_compile_options(shape_witness_test PRIVATE /utf-8 /EHsc)
+    endif()
+    add_test(NAME shape_witness COMMAND shape_witness_test)
 endif()

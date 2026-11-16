@@ -48,12 +48,36 @@ from shape_sdk import train_model, NativeModel, match_batch
   自动检测上游更新
 - OpenCV 运行库随制品分发（当前 opencv_world 4.10），与消费方自持的其他 OpenCV 版本互不共享
 
+## 兼容性与迁移
+
+0.1.0 起持久化校验收紧：detector 三参在持久化侧必须为正值。84ec8d9（P1）及更早版本
+用默认训练参数生成的两级容器，其 `meta.cfg` 三参写为 `[0,0,0]`，当前版本加载将拒绝
+（错误 `persisted detector thresholds must be positive`）。单级旧格式资产不受此收紧
+影响（其段内始终序列化实际三参）。
+
+迁移决策树：
+
+1. **有原始参考图与训练配置** → 用当前版本重新训练并导出，最干净；
+2. **无原图** → 用迁移工具从容器内各 fine 段恢复实际三参并回填 `meta.cfg`：
+   ```
+   python scripts/migrate_zero_cfg.py <旧容器> <新容器>
+   ```
+   工具校验各 fine 段序列化三参一致后改写元数据，并用当前版本加载核对 metadata
+   三参；段间不一致或三参已非零时原样输出（幂等）；
+3. **保留旧版本库** → 只读消费旧资产（容器 magic 与 ABI 未变，旧库可继续读取其
+   自产资产）。
+
+**不要**通过删除 `ref`/`cfg` 元数据规避校验：参考尺寸与训练配置会永久丢失，容器
+退化为弱回退解读（参考图几何仅剩派生值），不可逆。
+
 ## 基准与回归
 
 - `benchmarks/run_facts.py`：**端到端确定性基准**（官方绑定 + shape-facts v1 合成事实帧）——帧 1 训练锚模板（±30°/5°、单尺度），对四帧匹配并对照 spec 预期真值（在场性 + 中心定位 ≤8px），输出训练/逐帧耗时。当前基线：训练 ~0.6s（13 位姿）、匹配 5–10ms/帧（1280×960）、四帧全过（中心偏差 <0.2px、零误报）
 - `benchmarks/shape-facts-v1/`：合成基准资产（4 帧确定性 PNG + 图案生成器源码 + 机器可读规格含预期真值与字节哈希）
 - `benchmarks/shape-matching-real48-v1/`：48 例真实素材基准（4 平移×8 旋转×2 亮度×2 噪声，含历史结果真值指纹与生成器源档）
 - `tests/`：C++ 单元回归（几何精修/帧准备/粗图/聚类，`-BuildTests` 启用）
+- `scripts/test_main_chain.py`：Python 绑定主链回归（训练→元数据→往返→容器篡改→批量→生命周期），
+  `-BuildTests` 在装配完成后自动执行，为构建门禁一部分（需 python + numpy）
 - `scripts/smoke_binding.py`：绑定加载冒烟（manifest 校验 + ABI 协商）
 
 引擎改动后跑 `run_facts.py` 与 CTest 作为最低回归门；性能对比基准（多线程批量、

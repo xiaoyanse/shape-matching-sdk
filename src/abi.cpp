@@ -173,7 +173,8 @@ int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_size, int32_t 
         // 跨参共享 PreparedFrame 会触发 vendor 同参断言；两级匹配内部自行缩图，不共享。
         std::map<std::tuple<int, float, float>, vfshape::PreparedFrame> frames;
         std::set<std::tuple<int, float, float>> failed_groups;
-        auto fail_group = [&](const std::tuple<int, float, float>& key, const char* message) {
+        auto fail_group = [&](const std::tuple<int, float, float>& key, const char* message,
+                              int32_t status = 1) {
             failed_groups.insert(key);
             for (uint32_t m = 0; m < item_count; ++m) {
                 if (!models[m] || !models[m]->single) continue;
@@ -181,7 +182,7 @@ int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_size, int32_t 
                 if (std::make_tuple(detector.tuned_features, detector.tuned_weak,
                                     detector.tuned_strong) != key)
                     continue;
-                items[m].status = 1;
+                items[m].status = status;
                 copy_error(items[m].error, sizeof(items[m].error), message);
             }
         };
@@ -208,7 +209,7 @@ int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_size, int32_t 
                 fail_group(key, ex.what());
                 continue;
             } catch (...) {
-                fail_group(key, "unknown native frame preparation failure");
+                fail_group(key, "unknown native frame preparation failure", 2);
                 continue;
             }
             prepared_pixels += frame_pixels;

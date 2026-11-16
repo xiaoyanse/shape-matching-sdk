@@ -62,9 +62,10 @@ void group_default_params_materialize() {
     check_backfill(loaded.handle, 128, 30, 60, "默认参加载句柄");
 }
 
-// 容器跨段篡改组：meta 字段与模板 PNG 的跨段一致性拒绝 + 头部边长控件
+// 容器跨段篡改组：meta 字段与模板段格式合同（PNG 四条头部文案+边长控件）
 void group_container_tamper() {
     const auto container = custom_container();
+    const size_t png_index = container_segments(container) - 2;
     expect_load_reject(with_meta_text(container, "\"k\":2", "\"k\":4"),
                        "coarse segment disagrees with reference scale", "k 改档");
     expect_load_reject(with_meta_text(container, "\"cfg\":[32,32,176,176",
@@ -73,44 +74,86 @@ void group_container_tamper() {
     expect_load_reject(with_meta_text(container, "\"cfg\":[32,32,176,176",
                                      "\"cfg\":[0,32,176,176"),
                        "fine segment disagrees with original training ROI", "ROI 原点改写");
-    cv::Mat oversize(24, 4097, CV_8UC1, cv::Scalar(0));
+
+    cv::Mat valid(24, 4096, CV_8UC1, cv::Scalar(0));
     std::vector<uint8_t> png;
-    cv::imencode(".png", oversize, png);
-    expect_load_reject(replace_segment(container, container_segments(container) - 2, png),
-                       "template image header exceeds edge budget", "PNG 4097 超边长");
-    cv::Mat edge(24, 4096, CV_8UC1, cv::Scalar(0));
+    cv::imencode(".png", valid, png);
+    auto replaced_png = [&](std::vector<uint8_t> bytes) {
+        return replace_segment(container, png_index, std::move(bytes));
+    };
+    expect_load_reject(replaced_png(std::vector<uint8_t>(png.begin(), png.begin() + 12)),
+                       "template image header too short", "PNG 截断 12 字节");
+    auto bad_chunk = std::vector<uint8_t>(png.begin(), png.begin() + 24);
+    std::memcpy(bad_chunk.data() + 12, "IDAT", 4);
+    expect_load_reject(replaced_png(bad_chunk), "template image header first chunk is not IHDR",
+                       "首块非 IHDR");
+    std::string pgm = "P5\n176 176\n255\n";
+    std::vector<uint8_t> pgm_bytes(pgm.begin(), pgm.end());
+    pgm_bytes.insert(pgm_bytes.end(), size_t(176) * 176, 0);
+    expect_load_reject(replaced_png(pgm_bytes), "template image header signature is not PNG",
+                       "PGM 冒充模板段");
+    std::vector<uint8_t> bmp{'B', 'M', 0, 0, 0, 0, 0, 0, 0, 0,
+                             0,   0,   0, 0, 0, 0, 0, 0, 0, 0,
+                             0,   0,   0, 0};
+    expect_load_reject(replaced_png(bmp), "template image header signature is not PNG",
+                       "BMP 冒充模板段");
+
+    cv::Mat oversize(24, 4097, CV_8UC1, cv::Scalar(0));
     png.clear();
-    cv::imencode(".png", edge, png);
+    cv::imencode(".png", oversize, png);
+    expect_load_reject(replaced_png(png), "template image header exceeds edge budget",
+                       "PNG 4097 超边长");
+    png.clear();
+    cv::imencode(".png", valid, png);
     uint64_t handle = 0;
-    const auto control = replace_segment(container, container_segments(container) - 2, png);
+    const auto control = replaced_png(png);
     const int32_t rc =
         vf_shape_load(control.data(), control.size(), &handle, g_error, sizeof(g_error));
     if (rc == 0 && handle) vf_shape_close(handle, nullptr, 0);
     const std::string error_text(g_error);
-    check(rc == 1 && error_text.find("disagrees with original training ROI") != std::string::npos &&
-              error_text.find("header exceeds") == std::string::npos,
+    check(rc == 1 &&
+              error_text.find("disagrees with original training ROI") != std::string::npos &&
+              error_text.find("header") == std::string::npos,
           "PNG 4096 控件应通过头部预检后死在 ROI 一致性，实际 rc=" + std::to_string(rc) +
               "：" + g_error);
 }
 
-// 容量合同组：四目标容量 4 必须返回 4（防去重缺失回退）；坏容量时垃圾 count 清零
+// 容量合同组：四目标容量 4 恰返回 4、五目标足容量全召回；坏容量垃圾 count 清零；
+// 1×1 图批量外层拒绝且条目保持初始化状态
 void group_capacity_contract() {
     const cv::Mat ref = synth_reference();
     const auto config = make_config({32, 32, 176, 176}, 0, 0, 1, 1, 1, 1, 20, 40, 32);
     HandleGuard trained{train_handle(ref, config, "容量模板")};
-    const cv::Point places[] = {{100, 100}, {300, 100}, {800, 100}, {1350, 1350}};
-    const cv::Mat frame = place_targets(ref, places, 4);
+    const cv::Point places4[] = {{100, 100}, {300, 100}, {800, 100}, {1350, 1350}};
+    const cv::Mat frame4 = place_targets(ref, places4, 4);
     std::vector<vf_shape_candidate> out(4);
-    const uint32_t count = match_count(trained.handle, frame, 60.0, out, "四目标容量4");
+    const uint32_t count = match_count(trained.handle, frame4, 60.0, out, "四目标容量4");
     check(count == 4, "四目标容量 4 返回 " + std::to_string(count) + " 应恰为 4");
-    for (int i = 0; i < 4; ++i) {
-        bool covered = false;
-        for (uint32_t j = 0; j < count && !covered; ++j) {
-            const double dx = out[j].center[0] - (places[i].x + 87.5);
-            const double dy = out[j].center[1] - (places[i].y + 87.5);
-            covered = std::hypot(dx, dy) < 40.0;
+    auto check_covered = [&](const std::vector<vf_shape_candidate>& found,
+                             const cv::Point places[], int target_count,
+                             const std::string& what) {
+        for (int i = 0; i < target_count; ++i) {
+            bool covered = false;
+            for (const auto& candidate : found) {
+                const double dx = candidate.center[0] - (places[i].x + 87.5);
+                const double dy = candidate.center[1] - (places[i].y + 87.5);
+                if (std::hypot(dx, dy) < 40.0) {
+                    covered = true;
+                    break;
+                }
+            }
+            check(covered, what + " 目标 " + std::to_string(i) + " 近旁 40px 无候选");
         }
-        check(covered, "目标 " + std::to_string(i) + " 近旁 40px 无候选");
+    };
+    check_covered(out, places4, 4, "四目标");
+    const cv::Point places5[] = {{100, 100}, {300, 100}, {800, 100}, {1350, 1350}, {100, 1350}};
+    const cv::Mat frame5 = place_targets(ref, places5, 5);
+    for (uint32_t capacity : {5u, 8u, 16u}) {
+        std::vector<vf_shape_candidate> out5(capacity);
+        const uint32_t count5 = match_count(trained.handle, frame5, 60.0, out5, "五目标容量");
+        check(count5 == 5, "五目标容量 " + std::to_string(capacity) + " 返回 " +
+                               std::to_string(count5) + " 应恰为 5");
+        check_covered(out5, places5, 5, "五目标容量 " + std::to_string(capacity));
     }
     uint32_t stale = 999;
     const int32_t rc = vf_shape_match(
@@ -119,6 +162,17 @@ void group_capacity_contract() {
     check(rc == 1 && stale == 0,
           "坏容量应返回码 1 且清零垃圾 count：rc=" + std::to_string(rc) + " count=" +
               std::to_string(stale));
+    std::vector<vf_shape_candidate> out_tiny(4);
+    std::vector<vf_shape_batch_item> tiny{make_item(trained.handle, 60.0, out_tiny)};
+    const uint8_t pixel[3] = {0, 0, 0};
+    const int32_t tiny_rc =
+        vf_shape_match_batch(pixel, 3, 1, 1, 3, tiny.data(), 1, sizeof(vf_shape_batch_item),
+                             g_error, sizeof(g_error));
+    check(tiny_rc == 1 && std::string(g_error).find("image must be 24..4096") != std::string::npos,
+          "1×1 图批量应外层拒绝：rc=" + std::to_string(tiny_rc) + "：" + g_error);
+    check(tiny[0].status == 1 && tiny[0].count == 0 && tiny[0].error[0] == '\0',
+          "外层拒绝时条目应保持初始化状态：status=" + std::to_string(tiny[0].status) +
+              " count=" + std::to_string(tiny[0].count) + " error=" + tiny[0].error);
 }
 
 // 预算组隔离组：9 参数组同帧批量，预算外组独立失败不影响预算内组
