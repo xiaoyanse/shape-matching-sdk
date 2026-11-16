@@ -1,0 +1,558 @@
+// 两级匹配、分组模型训练和版本化容器。
+// 容器格式字节级兼容（VF2S3）；单级旧资产向后兼容。
+
+#include "two_stage.hpp"
+#include "matching_profile.hpp"
+#include "coarse_image.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <future>
+#include <map>
+#include <sstream>
+#include <stdexcept>
+
+namespace vfshape {
+namespace {
+
+constexpr char kMagic[] = "VF2S3";
+constexpr size_t kMagicLen = 5;
+constexpr size_t kLenWidth = 8;
+
+uint64_t read_u64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= uint64_t(p[i]) << (8 * i);
+    return v;
+}
+void write_u64(std::vector<uint8_t>& out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) out.push_back(uint8_t((v >> (8 * i)) & 0xFF));
+}
+
+struct Meta {
+    int k = 8;
+    std::vector<GroupSpec> groups;
+};
+
+Meta parse_meta(const std::string& json) {
+    cv::FileStorage storage(json, cv::FileStorage::READ | cv::FileStorage::MEMORY |
+                                     cv::FileStorage::FORMAT_JSON);
+    require(storage.isOpened(), "invalid container metadata");
+    const auto factor = storage["k"];
+    require(factor.isInt(), "coarse factor must be an integer");
+    Meta meta;
+    meta.k = int(factor);
+    require(meta.k == 2 || meta.k == 4 || meta.k == 8, "invalid coarse factor");
+    const auto groups = storage["groups"], biases = storage["group_bias"];
+    require(groups.isSeq() && biases.isSeq() && groups.size() == biases.size() &&
+                groups.size() > 0 && groups.size() <= 64, "invalid group metadata");
+    auto number = [](const cv::FileNode& node) {
+        require(node.isInt() || node.isReal(), "group metadata must be numeric");
+        const double value = double(node);
+        require(std::isfinite(value), "group metadata must be finite");
+        return value;
+    };
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const auto bounds = groups[int(i)], bias = biases[int(i)];
+        require(bounds.isSeq() && bounds.size() == 2 && bias.isSeq() && bias.size() == 2,
+                "invalid group bounds or anchor");
+        GroupSpec group{number(bounds[0]), number(bounds[1]), number(bias[0]), number(bias[1])};
+        require(group.lo >= -180 && group.hi <= 180 && group.lo <= group.hi,
+                "invalid group angle range");
+        require(std::abs(group.bias_x) <= max_edge && std::abs(group.bias_y) <= max_edge,
+                "invalid group anchor");
+        meta.groups.push_back(group);
+    }
+    return meta;
+}
+
+std::string dump_meta(const TwoStageModel& model) {
+    std::ostringstream out;
+    out << "{\"k\":" << model.k << ",\"groups\":[";
+    for (size_t i = 0; i < model.groups.size(); ++i) {
+        if (i) out << ",";
+        out << "[" << model.groups[i].lo << "," << model.groups[i].hi << "]";
+    }
+    out << "],\"group_bias\":[";
+    for (size_t i = 0; i < model.groups.size(); ++i) {
+        if (i) out << ",";
+        out << "[" << model.groups[i].bias_x << "," << model.groups[i].bias_y << "]";
+    }
+    out << "]}";
+    return out.str();
+}
+
+int effective_k(int roi_w, int roi_h) {
+    // Python 对齐：阈值 56px（K8→K4→K2 降档）
+    const int longest = std::max(roi_w, roi_h);
+    for (int k : {8, 4, 2})
+        if (longest >= 56 * k) return k;
+    return 2;
+}
+
+// 恒等（或指定角）自匹配测锚点偏置：Python _measure_anchor_bias 对齐
+void measure_bias(Model& model, const cv::Mat& image_bgr,
+                  const cv::Rect& roi, double angle_deg, double* bx, double* by) {
+    // 注意：target 必须独立分配——`cv::Mat target = image_bgr` 浅拷贝共享数据，
+    // warpAffine 的 src/dst 同 Mat 是未定义行为（实测旋转图损坏 74% 像素差异，
+    // 组偏置被测成 (19,-14) 级离谱值）。
+    // 性能：旋转与匹配限制在 ROI 邻域窗（目标位置已知=ROI 中心±模板半径），
+    // 全图 match ~400ms → 窗口 ~30ms（偏置测量 4 次/训练）。
+    const double cx = roi.x + roi.width / 2.0, cy = roi.y + roi.height / 2.0;
+    const double radius = std::hypot(double(roi.width), double(roi.height)) / 2.0 + 64.0;
+    const int wx0 = int(std::max(0.0, cx - radius)), wy0 = int(std::max(0.0, cy - radius));
+    const int wx1 = int(std::min(double(image_bgr.cols), cx + radius + 1.0));
+    const int wy1 = int(std::min(double(image_bgr.rows), cy + radius + 1.0));
+    if (wx1 - wx0 < 64 || wy1 - wy0 < 64) {
+        *bx = 0;
+        *by = 0;
+        return;
+    }
+    cv::Mat patch = image_bgr(cv::Rect(wx0, wy0, wx1 - wx0, wy1 - wy0));
+    cv::Mat target;
+    const double pcx = cx - wx0, pcy = cy - wy0;  // ROI 中心的窗口系坐标
+    if (std::abs(angle_deg) > 1e-9) {
+        auto m = cv::getRotationMatrix2D(cv::Point2d(pcx, pcy), angle_deg, 1.0);
+        cv::warpAffine(patch, target, m, patch.size());
+    } else {
+        target = patch;
+    }
+    try {
+        auto cands = match(model, target, 50.0);
+        require(!cands.empty(), "anchor calibration found no candidates");
+        const auto& best = *std::max_element(
+            cands.begin(), cands.end(),
+            [](const vf_shape_candidate& a, const vf_shape_candidate& b) {
+                return a.score < b.score;
+            });
+        *bx = best.center[0] - pcx;
+        *by = best.center[1] - pcy;
+    } catch (...) {
+        *bx = 0;
+        *by = 0;
+    }
+}
+
+}  // namespace
+
+
+// —— 两级训练（Python train_packaged 对齐）——
+std::shared_ptr<TwoStageModel> train_two_stage(
+    const cv::Mat& image_bgr, const vf_shape_train_config& config) {
+    const int w = image_bgr.cols, h = image_bgr.rows;
+    validate_config(config, w, h);
+    const cv::Rect roi(config.roi_x, config.roi_y, config.roi_width, config.roi_height);
+
+    // 角度分组：group_span=16°（8° 步长+8° 余量），重叠 8°
+    const double fine_step = std::min(config.angle_step, 0.5);
+    const double total = config.angle_max - config.angle_min;
+    const double group_span = kCoarseAngleStep * 2;
+    const int n_groups =
+        (total > group_span) ? int(std::ceil(total / group_span)) : 1;
+
+    auto model = std::make_shared<TwoStageModel>();
+    model->base_config = config;
+    model->groups.resize(n_groups);
+
+    auto train_fine = [&](double lo, double hi) {
+        vf_shape_train_config fc = config;
+        fc.angle_min = lo;
+        fc.angle_max = hi;
+        fc.angle_step = fine_step;
+        fc.scale_min = 1.0;
+        fc.scale_max = 1.0;
+        fc.scale_step = 1.0;
+        // 相邻组来自同一张参考图，重叠角度复用完全相同的特征。
+        return train(image_bgr, fc, model->fines.empty() ? nullptr : model->fines.back().get());
+    };
+
+    if (n_groups <= 1) {
+        model->fines.push_back(train_fine(config.angle_min, config.angle_max));
+        model->groups[0] = {config.angle_min, config.angle_max, 0, 0};
+    } else {
+        const double overlap = kCoarseAngleStep;
+        const double stride = total / n_groups;
+        for (int i = 0; i < n_groups; ++i) {
+            double lo = config.angle_min + i * stride - (i ? overlap : 0);
+            double hi = config.angle_min + (i + 1) * stride + (i < n_groups - 1 ? overlap : 0);
+            lo = std::max(config.angle_min, lo);
+            hi = std::min(config.angle_max, hi);
+            model->fines.push_back(train_fine(lo, hi));
+            model->groups[i] = {lo, hi, 0, 0};
+        }
+    }
+
+    // 粗层：K 逐档重试（Python 对齐：56 阈值 + 失败显式抛错）
+    const int k0 = effective_k(config.roi_width, config.roi_height);
+    const int coarse_steps = std::min(
+        3, std::max(1, int(std::lround((config.scale_max - config.scale_min) /
+                                        std::max(0.05, config.scale_step / 2))) + 1));
+    bool coarse_ok = false;
+    for (int k : {k0, 4, 2}) {
+        if (k > k0) continue;
+        cv::Mat small;
+        resize_coarse_image(image_bgr, small, k);
+        vf_shape_train_config cc = config;
+        cc.roi_x = std::max(1, config.roi_x / k);
+        cc.roi_y = std::max(1, config.roi_y / k);
+        cc.roi_width = std::max(24, config.roi_width / k);
+        cc.roi_height = std::max(24, config.roi_height / k);
+        cc.angle_step = kCoarseAngleStep;
+        cc.scale_step = std::max(0.05, (config.scale_max - config.scale_min) /
+                                            std::max(1, coarse_steps - 1));
+        try {
+            model->coarse = train(small, cc);
+            model->k = k;
+            coarse_ok = true;
+            break;
+        } catch (...) {
+            continue;
+        }
+    }
+    if (!coarse_ok)
+        throw std::runtime_error(
+            "coarse model training failed at all K levels (features insufficient)");
+
+    // 模板灰度 + B7 点
+    cv::Mat roi_bgr = image_bgr(roi);
+    cv::cvtColor(roi_bgr, model->tmpl_gray, cv::COLOR_BGR2GRAY);
+    model->b7 = extract_b7_points(model->tmpl_gray);
+
+    // 组级偏置：每组在其中心角合成旋转图上测（Python 对齐）
+    for (size_t i = 0; i < model->groups.size(); ++i) {
+        const double mid = (model->groups[i].lo + model->groups[i].hi) / 2.0;
+        measure_bias(*model->fines[i], image_bgr, roi, mid,
+                     &model->groups[i].bias_x, &model->groups[i].bias_y);
+    }
+    return model;
+}
+
+// —— 容器编解码 ——
+std::vector<uint8_t> encode_two_stage(const TwoStageModel& model) {
+    // 段：fines 导出 bytes ×n + coarse + tmpl_png + meta
+    std::vector<std::vector<uint8_t>> fines_bytes;
+    for (auto& f : model.fines) fines_bytes.push_back(encode(*f));
+    std::vector<uint8_t> coarse_bytes = encode(*model.coarse);
+    std::vector<uint8_t> tmpl_bytes;
+    cv::imencode(".png", model.tmpl_gray, tmpl_bytes);
+    const std::string meta = dump_meta(model);
+
+    std::vector<uint8_t> out(kMagic, kMagic + kMagicLen);
+    write_u64(out, model.fines.size());
+    // 长度前缀：fines... + coarse + tmpl + meta
+    for (auto& b : fines_bytes) write_u64(out, b.size());
+    write_u64(out, coarse_bytes.size());
+    write_u64(out, tmpl_bytes.size());
+    write_u64(out, meta.size());
+    for (auto& b : fines_bytes) out.insert(out.end(), b.begin(), b.end());
+    out.insert(out.end(), coarse_bytes.begin(), coarse_bytes.end());
+    out.insert(out.end(), tmpl_bytes.begin(), tmpl_bytes.end());
+    out.insert(out.end(), meta.begin(), meta.end());
+    return out;
+}
+
+std::shared_ptr<TwoStageModel> decode_two_stage(const uint8_t* bytes, uint64_t size) {
+    require(bytes && size <= 32ULL * 1024 * 1024, "invalid model buffer or size");
+    if (size < kMagicLen || std::memcmp(bytes, kMagic, kMagicLen) != 0) return nullptr;
+    size_t off = kMagicLen;
+    if (off + kLenWidth > size) return nullptr;
+    const uint64_t n = read_u64(bytes + off);
+    off += kLenWidth;
+    if (n == 0 || n > 64) return nullptr;
+    if (off + (n + 3) * kLenWidth > size) return nullptr;
+    std::vector<uint64_t> lens;
+    for (uint64_t i = 0; i < n + 3; ++i) {
+        lens.push_back(read_u64(bytes + off));
+        off += kLenWidth;
+    }
+    std::vector<std::vector<uint8_t>> parts;
+    for (uint64_t i = 0; i < n + 3; ++i) {
+        if (lens[i] > size - off) return nullptr;
+        parts.emplace_back(bytes + off, bytes + off + lens[i]);
+        off += lens[i];
+    }
+    require(off == size, "container trailing bytes");
+    auto model = std::make_shared<TwoStageModel>();
+    for (uint64_t i = 0; i < n; ++i)
+        model->fines.push_back(decode(parts[i].data(), parts[i].size()));
+    model->coarse = decode(parts[n].data(), parts[n].size());
+    model->tmpl_gray = cv::imdecode(parts[n + 1], cv::IMREAD_GRAYSCALE);
+    if (model->tmpl_gray.empty()) return nullptr;
+    const Meta meta = parse_meta(std::string(parts[n + 2].begin(), parts[n + 2].end()));
+    model->k = meta.k;
+    require(model->k == 2 || model->k == 4 || model->k == 8, "invalid coarse factor");
+    model->groups = meta.groups;
+    if (model->groups.size() != model->fines.size()) return nullptr;
+    if (model->fines.empty() || !model->coarse) return nullptr;
+    model->base_config = model->fines.front()->config;
+    model->b7 = extract_b7_points(model->tmpl_gray);
+    return model;
+}
+
+
+namespace {
+
+// 组选择（Python _fine_for_angle 对齐：重叠区取覆盖最多的一组）
+const Model* fine_for_angle(const TwoStageModel& model, double angle, const GroupSpec** spec) {
+    const Model* best = model.fines.front().get();
+    const GroupSpec* best_spec = &model.groups.front();
+    double best_cover = -1.0;
+    for (size_t i = 0; i < model.fines.size(); ++i) {
+        const auto& g = model.groups[i];
+        if (g.lo - 1e-9 <= angle && angle <= g.hi + 1e-9) {
+            const double cover = std::min(g.hi, angle + 180) - std::max(g.lo, angle - 180);
+            if (cover > best_cover) {
+                best_cover = cover;
+                best = model.fines[i].get();
+                best_spec = &g;
+            }
+        }
+    }
+    *spec = best_spec;
+    return best;
+}
+
+void reproject_candidate(vf_shape_candidate& c, int x0, int y0,
+                         const GroupSpec& g, double cs) {
+    // Python _reproject 对齐（ds=1）：扣组偏置 → ×cs → +窗口原点；
+    // transform 同链复合；scale=输出×cs。
+    const double up = cs;
+    c.center[0] = (c.center[0] - g.bias_x) * up + x0;
+    c.center[1] = (c.center[1] - g.bias_y) * up + y0;
+    for (int i = 0; i < 4; ++i) {
+        c.corners[2 * i] = (c.corners[2 * i] - g.bias_x) * up + x0;
+        c.corners[2 * i + 1] = (c.corners[2 * i + 1] - g.bias_y) * up + y0;
+    }
+    c.bbox[0] = (c.bbox[0] - g.bias_x) * up + x0;
+    c.bbox[1] = (c.bbox[1] - g.bias_y) * up + y0;
+    c.bbox[2] *= up;
+    c.bbox[3] *= up;
+    const double a = c.transform[0], b = c.transform[1], t_x = c.transform[2];
+    const double d = c.transform[3], e = c.transform[4], t_y = c.transform[5];
+    c.transform[0] = a * up;
+    c.transform[1] = b * up;
+    c.transform[2] = (t_x - g.bias_x) * up + x0;
+    c.transform[3] = d * up;
+    c.transform[4] = e * up;
+    c.transform[5] = (t_y - g.bias_y) * up + y0;
+    c.scale = c.scale * cs;
+}
+
+}  // namespace
+
+namespace {
+// 跨候选聚类（对齐单级路径 matcher.cpp 的同对象合并：重叠比 >0.4 合并，
+// 姿态差异置歧义标志，簇内最高分为代表）——两级多窗口/跨组候选统一去重。
+bool same_object(const vf_shape_candidate& a, const vf_shape_candidate& b) {
+    const double iw =
+        std::max(0., std::min(a.bbox[0] + a.bbox[2], b.bbox[0] + b.bbox[2]) -
+                        std::max(a.bbox[0], b.bbox[0]));
+    const double ih =
+        std::max(0., std::min(a.bbox[1] + a.bbox[3], b.bbox[1] + b.bbox[3]) -
+                        std::max(a.bbox[1], b.bbox[1]));
+    const double overlap = iw * ih;
+    const double area = a.bbox[2] * a.bbox[3] + b.bbox[2] * b.bbox[3] - overlap;
+    return area > 0 && overlap / area > .4;
+}
+
+// 姿态歧义分数差豁免阈（0-100 相似度）：与 matcher.cpp 同值同语义，两处聚类
+// 的豁免口径必须一致，改动需同步
+constexpr double kAmbiguityScoreGap = 10.;
+
+std::vector<vf_shape_candidate> cluster_candidates(std::vector<vf_shape_candidate>&& raw) {
+    std::vector<vf_shape_candidate> objects;
+    for (auto& current : raw) {
+        if (current.center[0] < 0 || current.center[1] < 0) continue;
+        bool merged = false;
+        for (auto& object : objects) {
+            if (!same_object(object, current)) continue;
+            const double angle =
+                std::abs(std::remainder(object.angle - current.angle, 360.));
+            // 语义对齐 matcher.cpp：姿态差超限且两解分数接近（差 < 豁免阈）才置
+            // 歧义，分差拉开时高分解明显领先不置；标志只置位不清除（流式合并）
+            if ((angle >= 15 || std::abs(std::log(object.scale / current.scale)) >= .14) &&
+                std::abs(object.score - current.score) < kAmbiguityScoreGap)
+                object.pose_ambiguous = 1;
+            if (current.score > object.score) {
+                current.pose_ambiguous = object.pose_ambiguous;
+                object = current;
+            }
+            merged = true;
+            break;
+        }
+        if (!merged) objects.push_back(current);
+    }
+    return objects;
+}
+}  // namespace
+
+// —— 两级匹配（Python TwoStageMatcher._match_locked 对齐）——
+std::vector<vf_shape_candidate> match_two_stage(
+    TwoStageModel& model, const cv::Mat& image_bgr, double threshold, int max_candidates) {
+    require(std::isfinite(threshold) && threshold > 0 && threshold <= 100,
+            "invalid similarity threshold");
+    MatchProfile profile;
+    const int w = image_bgr.cols, h = image_bgr.rows;
+    // 粗层：1/k 缩图（4096 接口限制在编排内自然放开——缩图与窗口均小）
+    cv::Mat small;
+    MatchProfile::measure(profile.coarse_resize_ms, [&] {
+      resize_coarse_image(image_bgr, small, model.k);
+    });
+    std::vector<vf_shape_candidate> coarse_cands;
+    try {
+        coarse_cands = MatchProfile::measure(profile.coarse_ms, [&] {
+            return match(*model.coarse, small, std::max(45.0, threshold - 20.0));
+        });
+    } catch (...) {
+        return {};
+    }
+    if (coarse_cands.empty()) return {};
+    std::sort(coarse_cands.begin(), coarse_cands.end(),
+              [](const auto& a, const auto& b) { return a.score > b.score; });
+    if (coarse_cands.size() > 4) coarse_cands.resize(4);
+    // 恒定前两窗（Codex P1：分差启发在双目标场景丢第二目标）
+    const size_t use = std::min<size_t>(2, coarse_cands.size());
+    profile.count = int(use);
+
+    // 精修半窗自适应：模板对角/2 + 4k（窗口必须装得下模板）
+    double fine_half = 300.0;
+    if (!model.tmpl_gray.empty()) {
+        const double diag = std::hypot(double(model.tmpl_gray.cols), double(model.tmpl_gray.rows));
+        fine_half = std::max(240.0, diag / 2.0 + 4.0 * model.k);
+    }
+    const double fine_th = std::max(50.0, threshold * 0.85);
+    auto refine_window = [&](size_t ci) {
+        auto& trace = profile.windows[ci];
+        std::vector<vf_shape_candidate> window_results;
+        const auto& cc = coarse_cands[ci];
+        const double cx = cc.center[0] * model.k, cy = cc.center[1] * model.k;
+        double cs = (cc.scale > 0) ? cc.scale : 1.0;
+        double ca = cc.angle;
+        if (ca > 180) ca -= 360;
+        const GroupSpec* spec = nullptr;
+        const Model* fine_model = fine_for_angle(model, ca, &spec);
+
+        const double half = fine_half * std::max(1.0, cs);
+        const int x0 = int(std::max(0.0, cx - half)), y0 = int(std::max(0.0, cy - half));
+        const int x1 = int(std::min(double(w), x0 + 2 * half));
+        const int y1 = int(std::min(double(h), y0 + 2 * half));
+        if (x1 - x0 < 24 || y1 - y0 < 24) return window_results;
+        trace.width = x1 - x0; trace.height = y1 - y0;
+        trace.scale = cs; trace.angle = ca;
+        cv::Mat window = image_bgr(cv::Rect(x0, y0, x1 - x0, y1 - y0));
+
+        cv::Mat window_scaled = window;
+        const bool needs_scale = std::abs(cs - 1.0) > 0.02;
+        if (needs_scale) {
+            MatchProfile::Timer resize_timer(trace.resize_ms);
+            cv::resize(window, window_scaled,
+                       cv::Size(std::max(24, int(window.cols / cs)),
+                                std::max(24, int(window.rows / cs))),
+                       0, 0, cs > 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
+        }
+        cv::Mat effective = window_scaled;
+        std::vector<vf_shape_candidate> refined;
+        try {
+            auto best_score = [](const auto& candidates) {
+                double score = 0;
+                for (const auto& candidate : candidates) score = std::max(score, candidate.score);
+                return score;
+            };
+            auto prepare = [&](const cv::Mat& image) {
+                ++trace.prepares;
+                return MatchProfile::measure(trace.prepare_ms, [&] {
+                    return prepare_frame(image, &fine_model->detector);
+                });
+            };
+            auto evaluate = [&](Model& m, const PreparedFrame& frame) {
+                const int ready = frame.features.preparedLevels();
+                auto matches = MatchProfile::measure(trace.match_ms, [&] {
+                    return match_prepared(m, frame, fine_th);
+                });
+                trace.deferred_levels += frame.features.preparedLevels() - ready;
+                return matches;
+            };
+            auto prepared = prepare(window_scaled);
+            refined = evaluate(*const_cast<Model*>(fine_model), prepared);
+            if (best_score(refined) < threshold && needs_scale) {
+                ++trace.scale_retries;
+                auto retry_frame = prepare(window);
+                auto retry = evaluate(*const_cast<Model*>(fine_model), retry_frame);
+                if (best_score(retry) > best_score(refined)) {
+                    cs = 1.0;
+                    effective = window;
+                    prepared = std::move(retry_frame);
+                    refined = std::move(retry);
+                }
+            }
+            if (best_score(refined) < threshold && model.fines.size() > 1) {
+                for (size_t gi = 0; gi < model.fines.size() && best_score(refined) < threshold; ++gi) {
+                    auto& alternate = *model.fines[gi];
+                    if (&alternate == fine_model) continue;
+                    ++trace.group_retries;
+                    const auto& cfg = alternate.config;
+                    const auto& original = fine_model->config;
+                    std::vector<vf_shape_candidate> retry;
+                    if (cfg.weak_th == original.weak_th && cfg.strong_th == original.strong_th &&
+                        cfg.feature_count == original.feature_count) {
+                        retry = evaluate(alternate, prepared);
+                    } else {
+                        retry = match(alternate, effective, fine_th);
+                    }
+                    if (best_score(retry) > best_score(refined)) {
+                        refined = std::move(retry);
+                        spec = &model.groups[gi];
+                    }
+                }
+            }
+        } catch (...) {
+            return window_results;
+        }
+        for (auto& r : refined) {
+            reproject_candidate(r, x0, y0, *spec, cs);
+            window_results.push_back(r);
+        }
+        return window_results;
+    };
+    std::vector<vf_shape_candidate> results;
+    {
+    MatchProfile::Timer window_timer(profile.windows_ms);
+#ifdef VF_SHAPE_PARALLEL_WINDOWS
+    std::future<std::vector<vf_shape_candidate>> second;
+    if (use == 2) second = std::async(std::launch::async, refine_window, 1);
+    results = refine_window(0);
+    if (second.valid()) {
+        auto candidates = second.get();
+        results.insert(results.end(), candidates.begin(), candidates.end());
+    }
+#else
+    for (size_t ci = 0; ci < use; ++ci) {
+        auto candidates = refine_window(ci);
+        results.insert(results.end(), candidates.begin(), candidates.end());
+    }
+#endif
+    }
+    MatchProfile::Timer finish_timer(profile.finish_ms);
+    std::sort(results.begin(), results.end(),
+              [](const auto& a, const auto& b) { return a.score > b.score; });
+    results = cluster_candidates(std::move(results));
+    results.erase(std::remove_if(results.begin(), results.end(),
+        [threshold](const auto& candidate) { return candidate.score < threshold; }), results.end());
+    if (!results.empty() && !model.b7.px.empty()) {
+        auto& best = results.front();
+        double angle = best.angle > 180 ? best.angle - 360 : best.angle;
+        const auto refined = b7_refine(image_bgr, model.b7, best.center[0], best.center[1],
+                                       angle, best.scale);
+        if (refined.valid >= kB7MinValidPts &&
+            std::hypot(refined.x - best.center[0], refined.y - best.center[1]) <=
+                2.0 * kB7SearchRadius) {
+            apply_geometric_refinement(best, refined);
+        }
+    }
+    if (results.size() > size_t(max_candidates)) results.resize(max_candidates);
+    return results;
+}
+
+}  // namespace vfshape

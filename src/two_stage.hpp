@@ -1,0 +1,69 @@
+#pragma once
+// 两级匹配（粗到精+几何精修）。
+//
+// 结构：容器字节流（与 Python coarse_to_fine.py 的 VF2S3 格式字节级兼容，
+// 互为可加载）解析为 TwoStageModel——fines 角度分组模型 + coarse 粗层模型 +
+// 模板灰度图 + 组级锚点偏置 + B7 轮廓点/法线。匹配走：粗层 K 自适应缩图
+// 定位 → 原图窗口精修（按粗层锁定角度选组）→ B7 连续几何精修（top1）。
+//
+// 单级向后兼容：非容器格式（旧资产）回退单级路径。
+
+#include "model.hpp"
+
+#include <memory>
+#include <vector>
+
+namespace vfshape {
+
+struct GroupSpec {
+    double lo = 0, hi = 0;
+    double bias_x = 0, bias_y = 0;
+};
+
+struct B7Model {
+    // 模板轮廓点（相对模板中心）+法线（归一化梯度方向）
+    std::vector<double> px, py, nx, ny;
+};
+B7Model extract_b7_points(const cv::Mat& template_gray);
+
+struct TwoStageModel {
+    std::vector<std::shared_ptr<Model>> fines;   // 角度分组精修模型
+    std::shared_ptr<Model> coarse;               // 粗层模型
+    std::vector<GroupSpec> groups;               // 组界+组级偏置
+    int k = 8;                                   // 粗层缩放（训练期 ROI 自适应）
+    cv::Mat tmpl_gray;                           // 训练 ROI 灰度图（B7 基准）
+    B7Model b7;                                  // B7 轮廓点（惰性或训练期提取）
+    vf_shape_train_config base_config{};         // 原始训练配置（供 B7 角度步长等）
+};
+
+// 容器编解码（VF2S3 字节级兼容；返回 nullptr 表示非容器格式）
+std::shared_ptr<TwoStageModel> decode_two_stage(const uint8_t* bytes, uint64_t size);
+std::vector<uint8_t> encode_two_stage(const TwoStageModel& model);
+
+// 两级打包训练（等价 Python train_packaged）：fines 分组 + coarse + 偏置 + 容器
+std::shared_ptr<TwoStageModel> train_two_stage(
+    const cv::Mat& image_bgr, const vf_shape_train_config& config);
+
+// 两级匹配（等价 Python TwoStageMatcher.match，含 B7 top1 精修）
+std::vector<vf_shape_candidate> match_two_stage(
+    TwoStageModel& model, const cv::Mat& image_bgr, double threshold, int max_candidates);
+
+// B7 连续几何精修（内部；也用于对拍测试）
+struct B7Result {
+    double x = 0, y = 0, angle = 0, scale = 1;
+    int valid = 0;
+};
+B7Result b7_refine(const cv::Mat& gray, const B7Model& b7,
+                   double cx, double cy, double angle_deg, double scale);
+void apply_geometric_refinement(vf_shape_candidate& candidate, const B7Result& refined);
+
+// Python 侧参数对齐（单一真相源在容器 meta；此处仅训练期使用）
+constexpr double kCoarseAngleStep = 8.0;
+constexpr int kFineAngleStepMilli = 500;  // 0.5°（毫度表示避免浮点比较）
+constexpr double kB7SearchRadius = 4.0;
+constexpr int kB7MinValidPts = 24;
+constexpr double kB7EdgeGradMin = 30.0;
+constexpr int kB7GnIters = 4;
+constexpr int kB7OutlierSigmaX10 = 25;    // 2.5（十分之一表示）
+
+}  // namespace vfshape
