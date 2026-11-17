@@ -4,3 +4,4 @@
 __pycache__/
 build/
 dist/
+bindings/rust/shape-sdk/target/

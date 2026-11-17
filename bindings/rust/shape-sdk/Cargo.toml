@@ -1,0 +1,21 @@
+[package]
+name = "shape-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "VisionForge 形状模板匹配 SDK 官方 Rust 绑定（libloading 运行时装载，ABI v3）"
+
+# 运行时契约（角色对齐 bindings/python/pyproject.toml）：本 crate 不内嵌原生库，
+# 消费方随制品分发 dist/runtime（visionforge_shape.dll + runtime-manifest.json）
+# 并设置 SHAPE_SDK_RUNTIME，或使用仓内默认路径 dist/runtime。装载即校验
+# manifest 五文件 SHA256 哈希链并协商 ABI 版本 3。
+
+[dependencies]
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+# 测试专用：PNG 解码四帧基准帧（conformance.rs）；关闭默认特性只保留 png
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

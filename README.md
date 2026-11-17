@@ -1,13 +1,13 @@
 # shape-matching-sdk
 
-形状模板匹配引擎 SDK：C++17 动态库（C ABI v3）+ 官方 Python ctypes 绑定。
+形状模板匹配引擎 SDK：C++17 动态库（C ABI v3）+ 官方 Python ctypes 绑定 + 官方 Rust 绑定。
 提供模板训练、加载、导出与单/多模板旋转缩放匹配，面向工业视觉定位场景。
 
 ## 交付形态
 
 - 引擎：`visionforge_shape.dll`（Windows x64），训练/加载/导出/单模板与多模板匹配同库完成
 - 算法底座：line2Dup（shape_based_matching，BSD-2）+ 自研两段式匹配与几何精修，见 `THIRD_PARTY_NOTICES.md` / `UPSTREAM_PATCHES.md` / `vendor-integrity.json`
-- 绑定：`bindings/python/shape_sdk/`（ctypes，manifest 哈希校验 + ABI 协商内置）
+- 绑定：`bindings/python/shape_sdk/`（ctypes）与 `bindings/rust/shape-sdk`（libloading 运行时装载），均内置 manifest 哈希校验 + ABI 协商
 - 制品目录：`dist/runtime/`（DLL + OpenCV 运行库 + 许可证 + `runtime-manifest.json`，构建后生成，不入库）
 
 ## 构建
@@ -36,6 +36,39 @@ from shape_sdk import train_model, NativeModel, match_batch
 ```
 
 绑定加载时逐文件校验 manifest SHA256 并协商 ABI 版本（当前 3）；不匹配即拒绝加载。
+
+## Rust 绑定使用
+
+`bindings/rust/shape-sdk`（crate 名 `shape-sdk`，edition 2024）：
+
+```rust
+use shape_sdk::{train_model, BgrImage, Model, TrainParams};
+
+// BgrImage 合同：连续 uint8 BGR，data.len() == 3×宽×高，宽高 24–4096
+let reference = BgrImage::new(1280, 960, &bgr_buffer)?;
+let params = TrainParams {
+    roi_xywh: (30, 30, 200, 200),
+    angle_min: -30.0, angle_max: 30.0, angle_step: 5.0,
+    scale_min: 1.0, scale_max: 1.0, scale_step: 0.05,
+    detector: None,                        // None=原生默认三参 (128/30/60)
+};
+let model_bytes = train_model(reference, &params)?;
+let model = Model::from_bytes(&model_bytes)?;
+let hits = model.match_(reference, 70.0, 16)?;   // 阈值 (0,100]，容量 2..256
+model.close()?;                                   // 幂等；Drop 兜底
+```
+
+- 环境契约与 Python 侧一致：crate 不内嵌原生库，运行时目录优先取
+  `SHAPE_SDK_RUNTIME` 环境变量（制品目录），缺省仓内 `dist/runtime`（按编译期
+  crate 位置上溯仓根，前提是 crate 位于仓内 bindings/rust/shape-sdk；外部集成
+  须设环境变量）。装载即校验 manifest 全文件 SHA256 并协商 ABI 版本 3
+- MSRV 1.85；运行依赖 libloading/serde/serde_json/sha2，测试另依赖 `image`
+  （dev-only，PNG 解码基准帧）
+- 与 Python 侧的关系：同一 C ABI v3 之上的平行安全层，训练/匹配/批量/元数据
+  语义与错误口径对齐 `bindings/python/shape_sdk`。测试同样对齐：`tests/smoke.rs`
+  + `tests/abi_chain.rs` 对应 `scripts/test_main_chain.py` 核心组（全链/元数据
+  往返/detector 往返/批量混合/生命周期），`tests/conformance.rs` 复刻
+  `benchmarks/run_facts.py` 四帧事实基准全语义（同一 spec 真值断言）
 
 ## ABI 兼容合同（消费方对接必读）
 
@@ -79,6 +112,10 @@ from shape_sdk import train_model, NativeModel, match_batch
 - `scripts/test_main_chain.py`：Python 绑定主链回归（训练→元数据→往返→容器篡改→批量→生命周期），
   `-BuildTests` 在装配完成后自动执行，为构建门禁一部分（需 python + numpy）
 - `scripts/smoke_binding.py`：绑定加载冒烟（manifest 校验 + ABI 协商）
+- `bindings/rust/shape-sdk/tests/`：Rust 绑定回归（smoke + abi_chain 五组核心断言，
+  对齐 `scripts/test_main_chain.py` 与 `tests/abi_chain_test.cpp`）+ `conformance.rs`
+  四帧事实基准（复刻 `run_facts.py` 全语义，Rust 实测与 Python 基线对齐：
+  中心偏差 <0.2px、零误报）
 
 引擎改动后跑 `run_facts.py` 与 CTest 作为最低回归门；性能对比基准（多线程批量、
 与第三方引擎对拍）由消费方按需在其环境构建。
@@ -91,7 +128,7 @@ C ABI 单合同 + 官方绑定按真实消费方滚动补齐（不做全家桶�
 | --- | --- | --- |
 | C/C++ | 已支持 | `include/shape_matching.h` 头文件即绑定；后续补最小使用示例 |
 | Python | 已支持 | `bindings/python/shape_sdk`（ctypes，manifest 校验内置） |
-| Rust | 规划（第一优先） | FFI 声明 + 句柄/错误翻译安全封装 |
+| Rust | 已支持 | `bindings/rust/shape-sdk`（libloading 运行时装载，manifest 校验内置，MSRV 1.85） |
 | C# | 按需 | P/Invoke，消费方出现时补官方包 |
 | Java/Kotlin | 按需 | JNA 优先、JNI 备选；目标平台（JVM/Android）明确后实施 |
 
@@ -106,5 +143,6 @@ include/              C ABI 头文件
 vendor/shape_based_matching/  上游 line2Dup + MIPP（字节冻结，见 vendor-integrity.json）
 tests/                C++ 几何/帧准备回归测试（-BuildTests 启用）
 bindings/python/      官方 Python 绑定包 shape_sdk
+bindings/rust/        官方 Rust 绑定 crate shape-sdk
 scripts/              构建与装配脚本
 ```
