@@ -5,3 +5,5 @@ __pycache__/
 build/
 dist/
 bindings/rust/shape-sdk/target/
+bindings/python/.venv/
+bindings/python/*.egg-info/

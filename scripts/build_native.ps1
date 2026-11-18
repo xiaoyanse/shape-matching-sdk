@@ -141,8 +141,8 @@ if ($BuildTests) {
     # 覆盖调用方环境残留的 SHAPE_SDK_RUNTIME；-SkipAssemble 时不具备被测对象，不进入本分支。
     $python = Get-Command python -ErrorAction SilentlyContinue
     if (-not $python) { throw 'Python 主链门禁需要 python（含 numpy），未在 PATH 找到 python' }
-    & $python.Source -c "import numpy"
-    if ($LASTEXITCODE -ne 0) { throw 'Python 主链门禁依赖 numpy 未满足（绑定声明 numpy>=2,<3），环境未按契约准备' }
+    & $python.Source -c "import numpy; assert int(numpy.__version__.split('.')[0]) == 2, 'numpy ' + numpy.__version__ + ' 不符绑定契约 numpy>=2,<3'"
+    if ($LASTEXITCODE -ne 0) { throw 'Python 主链门禁依赖 numpy>=2,<3 未满足（缺失或主版本不符），环境未按契约准备' }
     $env:SHAPE_SDK_RUNTIME = $runtimeDir
     & $python.Source -B (Join-Path $sourceDir 'scripts/test_main_chain.py')
     if ($LASTEXITCODE -ne 0) { throw 'Python 主链回归失败' }

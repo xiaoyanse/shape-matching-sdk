@@ -27,15 +27,12 @@ DIST_MANIFEST = ROOT / "dist" / "runtime" / "runtime-manifest.json"
 
 
 def latest_build_dll() -> Path | None:
-    """出口门构建目录（build/tD*）按版本号降序发现最新 DLL。"""
-    directories = sorted(((ROOT / "build").glob("tD*")),
-                         key=lambda path: (len(path.name), path.name), reverse=True)
-    for directory in directories:
-        for name in ("Release/visionforge_shape.dll", "visionforge_shape.dll"):
-            candidate = directory / name
-            if candidate.is_file():
-                return candidate
-    return None
+    """构建目录（build/tD*）的 DLL 按实际构建时间（mtime）取最新，目录名不代表新旧。"""
+    candidates = [directory / name
+                  for directory in (ROOT / "build").glob("tD*")
+                  for name in ("Release/visionforge_shape.dll", "visionforge_shape.dll")
+                  if (directory / name).is_file()]
+    return max(candidates, key=lambda path: path.stat().st_mtime, default=None)
 METADATA_KEYS = (
     "reference_width", "reference_height", "roi_xywh",
     "angle_min", "angle_max", "angle_step", "scale_min", "scale_max", "scale_step",
@@ -43,20 +40,38 @@ METADATA_KEYS = (
 )
 
 
+def runtime_intact(runtime_dir: Path) -> bool:
+    """目录 manifest 可读且声明文件逐项哈希吻合才算可用，与绑定加载同口径。"""
+    try:
+        manifest = json.loads((runtime_dir / "runtime-manifest.json").read_text(encoding="utf-8"))
+        return all(hashlib.sha256((runtime_dir / name).read_bytes()).hexdigest() == digest
+                   for name, digest in manifest["files"].items())
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def dist_matches_build(digest: str) -> bool:
+    """根 dist 清单声明的 DLL 哈希等于当前构建时，dist 即最新运行时，无需装配。"""
+    try:
+        manifest = json.loads(DIST_MANIFEST.read_text(encoding="utf-8"))
+        return manifest["files"].get("visionforge_shape.dll") == digest
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def assemble_runtime() -> None:
-    """构建 DLL 与根 dist 清单不一致时自装配 build/tD/runtime（不写根 dist）。"""
+    """显式 SHAPE_SDK_RUNTIME 完整可用即零写盘直用；仅未设置或不可用时自装配（不写根 dist）。"""
     built = latest_build_dll()
     if built is None:
+        return
+    explicit = os.environ.get("SHAPE_SDK_RUNTIME")
+    if explicit and runtime_intact(Path(explicit)):
         return
     build_root = built.parents[1]
     runtime_dir = build_root / "runtime"
     digest = hashlib.sha256(built.read_bytes()).hexdigest()
-    try:
-        manifest = json.loads(DIST_MANIFEST.read_text(encoding="utf-8"))
-        if manifest["files"].get("visionforge_shape.dll") == digest:
-            return
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
+    if not explicit and dist_matches_build(digest):
+        return
     worlds = [p for p in OPENCV_BIN.glob("opencv_world*.dll") if not p.stem.endswith("d")]
     assert len(worlds) == 1, f"需要唯一 Release opencv_world DLL，实际 {len(worlds)} 个"
     sources = {
@@ -87,6 +102,13 @@ def assemble_runtime() -> None:
     os.environ.setdefault("SHAPE_SDK_RUNTIME", str(runtime_dir))
 
 
+def assert_numpy_contract() -> None:
+    """绑定契约 numpy>=2,<3；主版本越界即拒，防上界漂移静默通过。"""
+    major = int(np.__version__.split(".")[0])
+    assert major == 2, f"numpy 主版本不符绑定契约：实际 {np.__version__}，要求 numpy>=2,<3"
+
+
+assert_numpy_contract()
 assemble_runtime()
 
 sys.path.insert(0, str(ROOT / "bindings" / "python"))
