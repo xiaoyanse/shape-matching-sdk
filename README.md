@@ -126,7 +126,7 @@ C ABI 单合同 + 官方绑定按真实消费方滚动补齐（不做全家桶�
 
 | 语言 | 状态 | 说明 |
 | --- | --- | --- |
-| C/C++ | 已支持 | `include/shape_matching.h` 头文件即绑定；后续补最小使用示例 |
+| C/C++ | 已支持 | `include/shape_matching.h` 头文件即绑定；最小接入见 `examples/README.md` |
 | Python | 已支持 | `bindings/python/shape_sdk`（ctypes，manifest 校验内置） |
 | Rust | 已支持 | `bindings/rust/shape-sdk`（libloading 运行时装载，manifest 校验内置，MSRV 1.85） |
 | C# | 按需 | P/Invoke，消费方出现时补官方包 |
