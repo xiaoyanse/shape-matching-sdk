@@ -52,13 +52,59 @@ def segment_detector(segment: bytes) -> tuple[int, float, float]:
     return struct.unpack_from("<Idd", segment, offset)
 
 
+class DivergentFineParamsError(ValueError):
+    """fine 段序列化三参不一致；继承 ValueError 便于调用方统一捕获。"""
+
+
 def fine_params(parts: list[bytes]) -> tuple[int, float, float]:
     params = [segment_detector(seg) for seg in parts[:-3]]
     head = params[0]
     divergent = [p for p in params[1:] if p != head]
     if divergent:
-        raise ValueError(f"各 fine 段序列化三参不一致：{head} 与 {divergent[0]}")
+        raise DivergentFineParamsError(f"各 fine 段序列化三参不一致：{head} 与 {divergent[0]}")
     return head
+
+
+def meta_cfg(parts: list[bytes]) -> tuple[dict, list]:
+    """解析 meta 段，返回 (meta dict, cfg list)；非法或 cfg 缺失/不足 13 项 raise ValueError。"""
+    try:
+        meta = json.loads(parts[-1].decode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"meta 段不是合法 JSON：{exc}；容器已损坏，未改动。") from exc
+    cfg = meta.get("cfg")
+    if not isinstance(cfg, list) or len(cfg) < 13:
+        raise ValueError("meta.cfg 缺失或长度非法，容器结构与预期不符")
+    return meta, cfg
+
+
+def migrate_container(container: bytes) -> tuple[bytes, bool]:
+    """迁移零 cfg 两级容器：从各 fine 段序列化三参恢复 meta.cfg，返回 (容器, 是否迁移)。
+
+    bytes 语义：入参与返回值均为完整 VF2S3 两级容器（meta 段为 UTF-8 JSON）；
+    输入不被修改，返回全新 bytes；纯内存无副作用——不读环境、不写盘、不打印。
+    幂等：meta.cfg 三参已非零时原样返回 (container, False)，不校验 fine 段。
+    错误约定（一律 raise ValueError，文案与 CLI 输出一致，输入容器不会被改动）：
+    - 非两级容器格式或长度非法；
+    - meta 段不是合法 JSON；
+    - meta.cfg 缺失或长度非法；
+    - fine 段三参不一致：raise DivergentFineParamsError（ValueError 子类）。
+    """
+    try:
+        parts = split_container(container)
+    except (ValueError, struct.error) as exc:
+        raise ValueError(f"{exc}；单级旧格式不受零 cfg 收紧影响，无需迁移。") from exc
+    meta, cfg = meta_cfg(parts)
+    current = tuple(cfg[10:13])
+    if all(current):
+        return container, False
+    try:
+        recovered = fine_params(parts)
+    except DivergentFineParamsError as exc:
+        raise DivergentFineParamsError(f"{exc}；无法安全恢复，原样输出，容器未改动。") from exc
+    # 段内 <Idd 序为 (features, weak, strong)，meta.cfg 序为 (weak, strong, features)
+    cfg[10:13] = [recovered[1], recovered[2], recovered[0]]
+    parts[-1] = json.dumps(meta).encode("utf-8")
+    return rebuild_container(parts), True
 
 
 def load_verify(container: bytes, expected: tuple[int, float, float]) -> tuple[bool, str]:
@@ -88,37 +134,23 @@ def main(argv: list[str]) -> int:
         print(f"读取输入失败：{exc}", file=sys.stderr)
         return 2
     try:
-        parts = split_container(container)
-    except (ValueError, struct.error) as exc:
-        print(f"{exc}；单级旧格式不受零 cfg 收紧影响，无需迁移。", file=sys.stderr)
+        migrated, changed = migrate_container(container)
+    except DivergentFineParamsError as exc:
+        print(exc, file=sys.stderr)
+        dst.write_bytes(container)
         return 1
-    try:
-        meta = json.loads(parts[-1].decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        print(f"meta 段不是合法 JSON：{exc}；容器已损坏，未改动。", file=sys.stderr)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
         return 1
-    cfg = meta.get("cfg")
-    if not isinstance(cfg, list) or len(cfg) < 13:
-        print("meta.cfg 缺失或长度非法，容器结构与预期不符", file=sys.stderr)
-        return 1
-    current = tuple(cfg[10:13])
-    if all(current):
-        print(f"meta.cfg 三参 {list(current)} 已非零，无需迁移；原样输出（幂等）。"
+    parts = split_container(container)
+    current = list(meta_cfg(parts)[1][10:13])
+    if not changed:
+        print(f"meta.cfg 三参 {current} 已非零，无需迁移；原样输出（幂等）。"
               "若该容器当前版本加载仍被拒，请用原图重新训练。")
         dst.write_bytes(container)
         return 0
-    try:
-        recovered = fine_params(parts)
-    except ValueError as exc:
-        print(f"{exc}；无法安全恢复，原样输出，容器未改动。", file=sys.stderr)
-        dst.write_bytes(container)
-        return 1
-    # 段内 <Idd 序为 (features, weak, strong)，meta.cfg 序为 (weak, strong, features)
-    cfg[10:13] = [recovered[1], recovered[2], recovered[0]]
-    migrated_parts = list(parts)
-    migrated_parts[-1] = json.dumps(meta).encode("utf-8")
-    migrated = rebuild_container(migrated_parts)
-    print(f"meta.cfg 三参 {list(current)} → 恢复自 {len(parts) - 3} 个 fine 段的 {list(recovered)}")
+    recovered = fine_params(parts)
+    print(f"meta.cfg 三参 {current} → 恢复自 {len(parts) - 3} 个 fine 段的 {list(recovered)}")
     ok, report = load_verify(migrated, recovered)
     print(report)
     if not ok:

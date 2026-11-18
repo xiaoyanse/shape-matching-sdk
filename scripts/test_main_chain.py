@@ -112,7 +112,9 @@ assert_numpy_contract()
 assemble_runtime()
 
 sys.path.insert(0, str(ROOT / "bindings" / "python"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
+from migrate_zero_cfg import migrate_container  # noqa: E402
 from shape_sdk import NativeModel, NativeShapeError, invoke, match_batch, train_model  # noqa: E402
 
 
@@ -356,6 +358,24 @@ def group_zero_cfg_migration() -> None:
             capture_output=True, text=True)
         assert result.returncode == 1, \
             f"零 cfg 且 fine 段三参不一致应退出 1：rc={result.returncode} {result.stdout.strip()}"
+
+        func_migrated, changed = migrate_container(zero_container)
+        assert changed and isinstance(func_migrated, bytes), \
+            f"函数形态迁移应返回 (bytes, True)：changed={changed}"
+        assert func_migrated == recovered, "函数迁移结果应与 CLI 迁移输出字节一致"
+        with NativeModel(func_migrated) as model:
+            func_actual = detector_tuple(model.metadata)
+            assert func_actual == (128, 30.0, 60.0), \
+                f"函数迁移后 metadata 三参不符：{func_actual} 应为 (128,30,60)"
+        rerun, changed_again = migrate_container(func_migrated)
+        assert not changed_again and rerun == func_migrated, \
+            f"已迁移容器函数重入应幂等 (原样, False)：changed={changed_again}"
+        try:
+            migrate_container(rebuild_container(tampered_parts))
+            raise AssertionError("fine 段三参不一致应 raise ValueError")
+        except ValueError as exc:
+            assert "各 fine 段序列化三参不一致" in str(exc), \
+                f"不一致错误文案异常：{exc!r}"
     finally:
         # 回收失败须显式报错并使门禁失败（路径随异常抛出），不静默吞掉
         shutil.rmtree(workspace)
