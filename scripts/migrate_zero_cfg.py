@@ -65,15 +65,22 @@ def fine_params(parts: list[bytes]) -> tuple[int, float, float]:
     return head
 
 
-def meta_cfg(parts: list[bytes]) -> tuple[dict, list]:
-    """解析 meta 段，返回 (meta dict, cfg list)；非法或 cfg 缺失/不足 13 项 raise ValueError。"""
+def meta_cfg(parts: list[bytes]) -> tuple[dict, list | None]:
+    """解析 meta 段，返回 (meta dict, cfg list)；ref/cfg 两键整体缺失时 cfg 为 None。
+
+    cfg 键存在但损坏（非列表或不足 13 项）、或 ref 在而 cfg 缺（成对合同破坏）raise ValueError。
+    """
     try:
         meta = json.loads(parts[-1].decode("utf-8"))
     except ValueError as exc:
         raise ValueError(f"meta 段不是合法 JSON：{exc}；容器已损坏，未改动。") from exc
-    cfg = meta.get("cfg")
+    if "cfg" not in meta:
+        if "ref" in meta:
+            raise ValueError("meta.cfg 缺失但 ref 存在，违反两键成对合同，容器已损坏")
+        return meta, None
+    cfg = meta["cfg"]
     if not isinstance(cfg, list) or len(cfg) < 13:
-        raise ValueError("meta.cfg 缺失或长度非法，容器结构与预期不符")
+        raise ValueError("meta.cfg 存在但非列表或长度非法，容器结构与预期不符")
     return meta, cfg
 
 
@@ -82,11 +89,14 @@ def migrate_container(container: bytes) -> tuple[bytes, bool]:
 
     bytes 语义：入参与返回值均为完整 VF2S3 两级容器（meta 段为 UTF-8 JSON）；
     输入不被修改，返回全新 bytes；纯内存无副作用——不读环境、不写盘、不打印。
-    幂等：meta.cfg 三参已非零时原样返回 (container, False)，不校验 fine 段。
+    原样返回 (container, False) 的两类分支：
+    - meta.cfg 三参已非零（幂等，不校验 fine 段）；
+    - ref/cfg 两键整体缺失的更早方言（84ec8d9 前）：loader 按派生回退受容，
+      无 cfg 可恢复，无需迁移。
     错误约定（一律 raise ValueError，文案与 CLI 输出一致，输入容器不会被改动）：
     - 非两级容器格式或长度非法；
     - meta 段不是合法 JSON；
-    - meta.cfg 缺失或长度非法；
+    - ref 存在而 cfg 缺失（成对合同破坏）或 meta.cfg 存在但长度非法；
     - fine 段三参不一致：raise DivergentFineParamsError（ValueError 子类）。
     """
     try:
@@ -94,6 +104,8 @@ def migrate_container(container: bytes) -> tuple[bytes, bool]:
     except (ValueError, struct.error) as exc:
         raise ValueError(f"{exc}；单级旧格式不受零 cfg 收紧影响，无需迁移。") from exc
     meta, cfg = meta_cfg(parts)
+    if cfg is None:
+        return container, False
     current = tuple(cfg[10:13])
     if all(current):
         return container, False
@@ -143,14 +155,17 @@ def main(argv: list[str]) -> int:
         print(exc, file=sys.stderr)
         return 1
     parts = split_container(container)
-    current = list(meta_cfg(parts)[1][10:13])
+    cfg = meta_cfg(parts)[1]
     if not changed:
-        print(f"meta.cfg 三参 {current} 已非零，无需迁移；原样输出（幂等）。"
-              "若该容器当前版本加载仍被拒，请用原图重新训练。")
+        if cfg is None:
+            print("ref/cfg 元数据整体缺失的早期方言容器，加载受容无需迁移；原样输出。")
+        else:
+            print(f"meta.cfg 三参 {list(cfg[10:13])} 已非零，无需迁移；原样输出（幂等）。"
+                  "若该容器当前版本加载仍被拒，请用原图重新训练。")
         dst.write_bytes(container)
         return 0
     recovered = fine_params(parts)
-    print(f"meta.cfg 三参 {current} → 恢复自 {len(parts) - 3} 个 fine 段的 {list(recovered)}")
+    print(f"meta.cfg 三参 {list(cfg[10:13])} → 恢复自 {len(parts) - 3} 个 fine 段的 {list(recovered)}")
     ok, report = load_verify(migrated, recovered)
     print(report)
     if not ok:

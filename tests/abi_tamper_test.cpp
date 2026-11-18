@@ -204,6 +204,52 @@ void group_batch_budget_groups() {
               "：" + items.back().error);
 }
 
+// 缺 ref/cfg 键早期方言组（84ec8d9 前）：F01 派生回退合同——加载受容、metadata
+// 派生语义钉死、派生模型再导出不固化派生值为原始键
+void group_legacy_missing_cfg() {
+    const cv::Mat ref = synth_reference();
+    const auto config = make_config({32, 32, 176, 176}, -20, 20, 8, 0.8, 1.2, 0.2);
+    HandleGuard trained{train_handle(ref, config, "缺键方言")};
+    // dump_meta 以 cfg 为末键：剥除从 ,"ref":[ 到末个 ']'（不含）即两键同删
+    auto strip_ref_cfg = [&](const std::vector<uint8_t>& container) {
+        std::vector<uint8_t> meta = segment_view(container, container_segments(container) - 1);
+        std::string text(meta.begin(), meta.end());
+        const size_t at = text.find(",\"ref\":[");
+        check(at != std::string::npos, "meta 段未找到 ref 键，容器非 F01 新格式");
+        const size_t last = text.rfind(']');
+        check(last != std::string::npos && last > at && text[last + 1] == '}',
+              "meta 段 ref/cfg 结构不符 dump_meta 预期");
+        text.erase(at, last + 1 - at);
+        return replace_segment(container, container_segments(container) - 1,
+                               std::vector<uint8_t>(text.begin(), text.end()));
+    };
+    const auto legacy = strip_ref_cfg(export_bytes(trained.handle, "缺键方言"));
+    HandleGuard loaded{load_handle(legacy, "缺键方言容器")};
+    check_backfill(loaded.handle, 128, 30, 60, "缺键方言段回填");
+    vf_shape_train_config meta{};
+    meta.struct_size = sizeof(meta);
+    int32_t width = 0, height = 0;
+    const int32_t rc =
+        vf_shape_metadata(loaded.handle, &meta, &width, &height, g_error, sizeof(g_error));
+    check(rc == 0, "缺键方言元数据失败 rc=" + std::to_string(rc) + "：" + g_error);
+    check(width == 176 && height == 176,
+          "缺键方言参考尺寸应派生为模板灰图尺寸 (176,176)，实际 (" + std::to_string(width) +
+              "," + std::to_string(height) + ")");
+    check(meta.angle_step == 0.5,
+          "缺键方言角度步应派生为 fine 细分步 0.5，实际 " + std::to_string(meta.angle_step));
+    check(meta.scale_min == 1.0 && meta.scale_max == 1.0 && meta.scale_step == 1.0,
+          "缺键方言缩放应派生为归一 1.0");
+    const auto reexported = export_bytes(loaded.handle, "缺键方言重导出");
+    const std::vector<uint8_t> reexport_meta =
+        segment_view(reexported, container_segments(reexported) - 1);
+    const std::string reexport_text(reexport_meta.begin(), reexport_meta.end());
+    check(reexport_text.find("\"ref\"") == std::string::npos &&
+              reexport_text.find("\"cfg\"") == std::string::npos,
+          "派生模型重导出不应固化派生值为 ref/cfg 原始键：" + reexport_text);
+    HandleGuard reloaded{load_handle(reexported, "重导出缺键容器")};
+    check_backfill(reloaded.handle, 128, 30, 60, "重导出容器段回填");
+}
+
 // K 档原因组：精修层可训练但粗层几何越下限，透传真实原因而非特征不足
 void group_k_fallback_reason() {
     cv::Mat dense(320, 320, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -238,6 +284,7 @@ int main() {
         {"m_capacity_contract", group_capacity_contract},
         {"n_batch_budget_groups", group_batch_budget_groups},
         {"o_k_fallback_reason", group_k_fallback_reason},
+        {"p_legacy_missing_cfg", group_legacy_missing_cfg},
     };
     int failures = 0;
     for (const auto& group : groups) {
