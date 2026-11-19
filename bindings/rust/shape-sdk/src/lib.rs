@@ -5,15 +5,18 @@
 //! 位置上溯仓根，前提是 crate 位于仓内 bindings/rust/shape-sdk；外部集成请设
 //! 环境变量）。装载即校验 manifest 哈希链并协商 `vf_shape_abi_version()==3`。
 //!
-//! 模块划分：`error`（错误语义）｜`ffi`（全部 unsafe：裸声明与指针调用）｜
-//! `library`（装载/校验/协商/全局缓存）｜`model`（安全层：训练/加载/匹配/批量）。
+//! 模块划分：`error`（错误语义+错误码人话）｜`ffi`（全部 unsafe：裸声明与指针
+//! 调用）｜`library`（装载/校验/协商/全局缓存）｜`model`（安全层：训练/加载/
+//! 匹配/批量）｜`diagnostics`（预算查询/最近错误/最近匹配诊断）。
 
+mod diagnostics;
 mod error;
 mod ffi;
 mod library;
 mod model;
 
-pub use error::ShapeError;
+pub use diagnostics::{BudgetReport, LastErrorInfo, MatchTrace};
+pub use error::{error_code, error_message, ShapeError};
 pub use library::ShapeLibrary;
 pub use model::{
     BatchRequest, BgrImage, Candidate, DetectorParams, Model, ModelMetadata, TrainParams,

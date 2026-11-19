@@ -5,11 +5,20 @@ visionforge_shape.dll 与 runtime-manifest.json），默认仓内 dist/runtime�
 消费方集成时随制品分发本包并设置环境变量，或把制品放到默认路径。
 """
 
+from .diagnostics import (
+    ERROR_CODES,
+    error_message,
+    estimate_training,
+    last_error_info,
+    last_match_info,
+)
 from .native import NativeCandidate, NativeModel, train_model
 from .native_batch import match_batch
 from .native_library import (
     BatchItem,
+    BudgetReport,
     Candidate,
+    MatchTrace,
     NativeShapeError,
     TrainConfig,
     invoke,
@@ -19,12 +28,19 @@ from .native_library import (
 
 __all__ = [
     "BatchItem",
+    "BudgetReport",
     "Candidate",
+    "ERROR_CODES",
+    "MatchTrace",
     "NativeCandidate",
     "NativeModel",
     "NativeShapeError",
     "TrainConfig",
+    "error_message",
+    "estimate_training",
     "invoke",
+    "last_error_info",
+    "last_match_info",
     "load_library",
     "match_batch",
     "runtime_directory",

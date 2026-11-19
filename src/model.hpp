@@ -1,5 +1,6 @@
 #pragma once
 #include "shape_matching.h"
+#include "error_code.hpp"
 #include "line2Dup.h"
 #include <array>
 #include <mutex>
@@ -72,7 +73,15 @@ struct PreparedFrame {
 cv::Mat checked_image(const uint8_t* image, uint64_t size, int width, int height,
                       uint64_t stride);
 std::vector<double> samples(double low, double high, double step, double min, double max,
-                            double wrap = 0);
+                            vf_shape_error_code range_code, double wrap = 0);
+// 配置域检查（结构/Detector 三参/ROI/角度缩放范围），不含预算判定
+void validate_config_domain(const vf_shape_train_config& config, int width, int height);
+// 预算核算纯函数（域合法前提；与 validate_config 拒绝顺序同式同序）
+vf_shape_budget_report account_training(const vf_shape_train_config& config,
+                                        int width, int height);
+// 预算查询：域检查 + 核算（不判超限失败，超限进 report.over_budget）
+vf_shape_budget_report estimate_training(const vf_shape_train_config& config,
+                                         int width, int height);
 void validate_config(const vf_shape_train_config& config, int width, int height);
 struct DetectorTuning { int features; float weak, strong; };
 DetectorTuning validate_detector_params(int features, double weak, double strong);

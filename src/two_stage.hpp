@@ -15,6 +15,8 @@
 
 namespace vfshape {
 
+struct MatchTraceSnapshot;  // matching_profile.hpp（诊断快照，指针透传）
+
 struct GroupSpec {
     double lo = 0, hi = 0;
     double bias_x = 0, bias_y = 0;
@@ -45,9 +47,11 @@ std::vector<uint8_t> encode_two_stage(const TwoStageModel& model);
 std::shared_ptr<TwoStageModel> train_two_stage(
     const cv::Mat& image_bgr, const vf_shape_train_config& config);
 
-// 两级匹配（等价 Python TwoStageMatcher.match，含 B7 top1 精修）
+// 两级匹配（等价 Python TwoStageMatcher.match，含 B7 top1 精修）；
+// trace 非空时回填最近一次匹配的诊断快照（计数常开，毫秒仅计时构建非 0）
 std::vector<vf_shape_candidate> match_two_stage(
-    TwoStageModel& model, const cv::Mat& image_bgr, double threshold, int max_candidates);
+    TwoStageModel& model, const cv::Mat& image_bgr, double threshold, int max_candidates,
+    MatchTraceSnapshot* trace = nullptr);
 
 // B7 连续几何精修（内部；也用于对拍测试）
 struct B7Result {

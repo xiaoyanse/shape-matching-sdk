@@ -61,6 +61,37 @@ class BatchItem(ct.Structure):
     ]
 
 
+class BudgetReport(ct.Structure):
+    _fields_ = [
+        ("struct_size", ct.c_uint32),
+        ("formula_version", ct.c_uint32),
+        ("pose_used", ct.c_uint32),
+        ("pose_limit", ct.c_uint32),
+        ("pose_over", ct.c_uint32),
+        ("canvas_used", ct.c_uint32),
+        ("canvas_limit", ct.c_uint32),
+        ("canvas_over", ct.c_uint32),
+        ("pixel_over", ct.c_uint32),
+        ("pixel_used", ct.c_uint64),
+        ("pixel_limit", ct.c_uint64),
+        ("over_budget", ct.c_int32),
+    ]
+
+
+class MatchTrace(ct.Structure):
+    _fields_ = [
+        ("struct_size", ct.c_uint32),
+        ("coarse_candidates", ct.c_uint32),
+        ("windows_searched", ct.c_uint32),
+        ("final_candidates", ct.c_uint32),
+        ("window_best_scores", ct.c_double * 8),
+        ("coarse_ms", ct.c_double),
+        ("coarse_resize_ms", ct.c_double),
+        ("windows_ms", ct.c_double),
+        ("finish_ms", ct.c_double),
+    ]
+
+
 _library: ct.CDLL | None = None
 _lock = threading.Lock()
 _dll_directories: list[object] = []
@@ -147,6 +178,37 @@ def load_library() -> ct.CDLL:
                 ) from exc
             function.argtypes = signature
             function.restype = ct.c_int32
+        # 诊断三件套为加性导出：旧运行时可能缺失，装载不得因此失败，
+        # 缺失时诊断接口在使用处报错
+        optional_signatures = {
+            "estimate_training": [
+                ct.POINTER(TrainConfig),
+                ct.c_int32,
+                ct.c_int32,
+                ct.POINTER(BudgetReport),
+            ]
+            + error,
+            "last_match_info": [ct.c_uint64, ct.POINTER(MatchTrace)] + error,
+            "last_error_info": [
+                ct.POINTER(ct.c_int32),
+                ct.POINTER(ct.c_double * 6),
+                ct.POINTER(ct.c_int32),
+            ],
+        }
+        optional = {}
+        for name, signature in optional_signatures.items():
+            try:
+                optional[name] = getattr(library, f"vf_shape_{name}")
+            except AttributeError:
+                optional[name] = None
+        library._diagnostics_exports = all(value is not None for value in optional.values())
+        for name, function in optional.items():
+            if function is None:
+                continue
+            function.argtypes = optional_signatures[name]
+            function.restype = ct.c_int32
+        if optional["last_error_info"] is not None:
+            optional["last_error_info"].restype = None
         _library = library
         return library
 

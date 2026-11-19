@@ -142,6 +142,11 @@ impl Model {
     /// 从模型资产字节加载（两级容器格式优先，非容器按旧单级格式解码）
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ShapeError> {
         let library = ShapeLibrary::global()?;
+        Self::from_library(&library, bytes)
+    }
+
+    /// 从指定库实例加载模型资产（多运行时部署/诊断入口用）
+    pub fn from_library(library: &Arc<ShapeLibrary>, bytes: &[u8]) -> Result<Self, ShapeError> {
         if bytes.is_empty() || bytes.len() > MAX_MODEL_BYTES {
             return Err(ShapeError::InvalidInput(
                 "模板模型字节非法或超过 32 MiB".into(),
@@ -149,7 +154,7 @@ impl Model {
         }
         let handle = library.abi().load(bytes)?;
         Ok(Self {
-            library,
+            library: Arc::clone(library),
             inner: Mutex::new(ModelInner { handle }),
         })
     }
@@ -167,6 +172,18 @@ impl Model {
         } else {
             Ok(inner.handle)
         }
+    }
+
+    /// 句柄锁下执行原生查询（诊断入口用；锁保护 open 检查与调用的原子性）
+    pub(crate) fn with_live_handle<T>(&self, f: impl FnOnce(u64) -> T) -> Result<T, ShapeError> {
+        let inner = self.lock_inner();
+        let handle = Self::require_open(&inner)?;
+        Ok(f(handle))
+    }
+
+    /// 原生 ABI 访问（诊断入口用）
+    pub(crate) fn library(&self) -> &ShapeLibrary {
+        &self.library
     }
 
     /// 查询训练配置回显与参考图尺寸

@@ -10,6 +10,7 @@ use libloading::os::windows::Library;
 #[cfg(not(windows))]
 use libloading::Library;
 
+use crate::diagnostics::{EstimateTrainingFn, LastErrorInfoFn, LastMatchInfoFn};
 use crate::error::ShapeError;
 
 /// 原生入口错误缓冲容量（对齐 Python 绑定的 2048 字节）
@@ -144,7 +145,7 @@ type MatchBatchFn = unsafe extern "C" fn(
     u32,
 ) -> i32;
 
-/// 已解析的原生 ABI：库句柄与 8 个入口的函数指针同寿命共存于本结构，
+/// 已解析的原生 ABI：库句柄与 11 个入口的函数指针同寿命共存于本结构，
 /// 调用仅经由本结构方法进行（库存活期间指针有效，不存在自引用失效问题）。
 pub(crate) struct NativeAbi {
     #[allow(dead_code)] // 字段本身承载库寿命；Drop 由它负责
@@ -157,6 +158,11 @@ pub(crate) struct NativeAbi {
     match_fn: MatchFn,
     close_fn: CloseFn,
     match_batch_fn: MatchBatchFn,
+    // 诊断三件套为加性导出（D1=A：v3 结构与函数零改动）：旧运行时可能缺失，
+    // 装载不得因此失败，缺失时对应诊断 API 报错
+    pub(crate) estimate_fn: Option<EstimateTrainingFn>,
+    pub(crate) last_match_fn: Option<LastMatchInfoFn>,
+    pub(crate) last_error_fn: Option<LastErrorInfoFn>,
 }
 
 /// 装载动态库。Windows 侧显式搜索 DLL 自身目录（同目录 opencv 依赖）与
@@ -223,6 +229,9 @@ impl NativeAbi {
                 match_batch_fn: *library
                     .get(b"vf_shape_match_batch\0")
                     .map_err(|_| missing("vf_shape_match_batch"))?,
+                estimate_fn: library.get(b"vf_shape_estimate_training\0").ok().map(|s| *s),
+                last_match_fn: library.get(b"vf_shape_last_match_info\0").ok().map(|s| *s),
+                last_error_fn: library.get(b"vf_shape_last_error_info\0").ok().map(|s| *s),
                 library,
             })
         }

@@ -5,9 +5,12 @@
 
 namespace vfshape {
 cv::Mat checked_image(const uint8_t* image, uint64_t size, int width, int height, uint64_t stride) {
-    require(image && width >= 24 && height >= 24 && width <= max_edge && height <= max_edge,
-            "image must be 24..4096 pixels on each edge");
-    require(stride == uint64_t(width) * 3 && size == stride * height, "expected contiguous BGR8 image");
+    require_coded(image && width >= 24 && height >= 24 && width <= max_edge && height <= max_edge,
+                  VF_SHAPE_INVALID_IMAGE, "image must be 24..4096 pixels on each edge",
+                  double(width), double(height));
+    require_coded(stride == uint64_t(width) * 3 && size == stride * height,
+                  VF_SHAPE_INVALID_IMAGE, "expected contiguous BGR8 image",
+                  double(stride), double(size));
     return cv::Mat(height, width, CV_8UC3, const_cast<uint8_t*>(image), size_t(stride));
 }
 
@@ -26,12 +29,15 @@ void Model::build_pose_adjacency() {
     detector.pose_adjacency["shape"] = std::move(adj);
 }
 
-std::vector<double> samples(double low, double high, double step, double min, double max, double wrap) {
-    require(std::isfinite(low) && std::isfinite(high) && std::isfinite(step) &&
-            low >= min && high <= max && high >= low && step > 0,
-            "invalid training range");
+std::vector<double> samples(double low, double high, double step, double min, double max,
+                            vf_shape_error_code range_code, double wrap) {
+    require_coded(std::isfinite(low) && std::isfinite(high) && std::isfinite(step) &&
+                  low >= min && high <= max && high >= low && step > 0,
+                  range_code, "invalid training range", low, high, step);
     const double intervals = (high - low) / step;
-    require(std::isfinite(intervals) && intervals < max_poses, "pose budget exceeded");
+    // 单轴档数超限归入该轴范围码：参数为当前步长、档数上限、建议步长
+    require_coded(std::isfinite(intervals) && intervals < max_poses, range_code,
+                  "pose budget exceeded", step, double(max_poses), (high - low) / 349.0);
     std::vector<double> values;
     for (int n = 0; n <= int(std::floor(intervals + 1e-9)); ++n) values.push_back(low + n * step);
     if (high - values.back() > 1e-7) values.push_back(high);
@@ -45,51 +51,115 @@ DetectorTuning validate_detector_params(int features, double weak, double strong
     const int f = features == 0 ? feature_count : features;
     const double w = weak == 0 ? weak_threshold : weak;
     const double s = strong == 0 ? strong_threshold : strong;
-    require(std::isfinite(w) && std::isfinite(s), "detector thresholds must be finite");
-    require(w > 0 && s > 0, "detector thresholds must be positive");
-    require(w <= s, "weak threshold must not exceed strong threshold");
-    require(s <= kMaxStrongThreshold, "strong threshold exceeds reachable gradient magnitude (1020)");
-    require(f >= 16 && f <= max_features_per_level, "feature count per level must be 16-512");
+    require_coded(std::isfinite(w) && std::isfinite(s), VF_SHAPE_DETECTOR_PARAMS,
+                  "detector thresholds must be finite", w, s);
+    require_coded(w > 0 && s > 0, VF_SHAPE_DETECTOR_PARAMS,
+                  "detector thresholds must be positive", w, s);
+    require_coded(w <= s, VF_SHAPE_DETECTOR_PARAMS,
+                  "weak threshold must not exceed strong threshold", w, s);
+    require_coded(s <= kMaxStrongThreshold, VF_SHAPE_DETECTOR_PARAMS,
+                  "strong threshold exceeds reachable gradient magnitude (1020)", s,
+                  kMaxStrongThreshold);
+    require_coded(f >= 16 && f <= max_features_per_level, VF_SHAPE_DETECTOR_PARAMS,
+                  "feature count per level must be 16-512", double(f), 16,
+                  double(max_features_per_level));
     // 训练入口同样防 float 下溢：极小正值转 float 归零会产出导出后无法加载的资产
     //（训练侧归一化零=默认合法，但下溢拒绝与持久化侧口径一致）
     const float fw = float(w), fs = float(s);
-    require(std::isfinite(fw) && std::isfinite(fs) && fw > 0 && fs > 0,
-            "detector thresholds not representable as positive float");
+    require_coded(std::isfinite(fw) && std::isfinite(fs) && fw > 0 && fs > 0,
+                  VF_SHAPE_DETECTOR_PARAMS, "detector thresholds not representable as positive float",
+                  w, s);
     return {f, fw, fs};
 }
 
 // 与训练侧语义相反：序列化字段是实际生效值，零=损坏须拒绝而非默认化；并防
 // double→float 下溢（极小正值转 float 归零）导致接受后再加载被默认化洗值。
 DetectorTuning validate_persisted_detector_params(int features, double weak, double strong) {
-    require(std::isfinite(weak) && std::isfinite(strong), "detector thresholds must be finite");
-    require(weak > 0 && strong > 0, "persisted detector thresholds must be positive");
-    require(weak <= strong, "weak threshold must not exceed strong threshold");
-    require(strong <= kMaxStrongThreshold, "strong threshold exceeds reachable gradient magnitude (1020)");
-    require(features >= 16 && features <= max_features_per_level, "feature count per level must be 16-512");
+    require_coded(std::isfinite(weak) && std::isfinite(strong), VF_SHAPE_MODEL_TAMPER,
+                  "detector thresholds must be finite", weak, strong);
+    require_coded(weak > 0 && strong > 0, VF_SHAPE_MODEL_TAMPER,
+                  "persisted detector thresholds must be positive", weak, strong);
+    require_coded(weak <= strong, VF_SHAPE_MODEL_TAMPER,
+                  "weak threshold must not exceed strong threshold", weak, strong);
+    require_coded(strong <= kMaxStrongThreshold, VF_SHAPE_MODEL_TAMPER,
+                  "strong threshold exceeds reachable gradient magnitude (1020)", strong,
+                  kMaxStrongThreshold);
+    require_coded(features >= 16 && features <= max_features_per_level, VF_SHAPE_MODEL_TAMPER,
+                  "feature count per level must be 16-512", double(features), 16,
+                  double(max_features_per_level));
     const float fw = static_cast<float>(weak), fs = static_cast<float>(strong);
-    require(std::isfinite(fw) && std::isfinite(fs) && fw > 0 && fs > 0,
-            "detector thresholds not representable as positive float");
+    require_coded(std::isfinite(fw) && std::isfinite(fs) && fw > 0 && fs > 0,
+                  VF_SHAPE_MODEL_TAMPER, "detector thresholds not representable as positive float",
+                  weak, strong);
     return {features, fw, fs};
 }
 
-void validate_config(const vf_shape_train_config& c, int width, int height) {
+void validate_config_domain(const vf_shape_train_config& c, int width, int height) {
     require(c.struct_size == sizeof(c), "invalid training ABI structure size");
     validate_detector_params(c.feature_count, c.weak_th, c.strong_th);
-    require(c.roi_x >= 0 && c.roi_y >= 0 && c.roi_width >= 24 && c.roi_height >= 24 &&
-            c.roi_width <= width && c.roi_height <= height &&
-            c.roi_x <= width - c.roi_width && c.roi_y <= height - c.roi_height, "invalid training ROI");
-    const auto angles = samples(c.angle_min, c.angle_max, c.angle_step, -180, 180);
-    const auto scales = samples(c.scale_min, c.scale_max, c.scale_step, .25, 2);
-    require(angles.size() * scales.size() <= max_poses, "pose budget exceeded");
+    require_coded(c.roi_x >= 0 && c.roi_y >= 0 && c.roi_width >= 24 && c.roi_height >= 24 &&
+                  c.roi_width <= width && c.roi_height <= height &&
+                  c.roi_x <= width - c.roi_width && c.roi_y <= height - c.roi_height,
+                  VF_SHAPE_INVALID_ROI, "invalid training ROI", double(c.roi_width),
+                  double(c.roi_height));
+    samples(c.angle_min, c.angle_max, c.angle_step, -180, 180, VF_SHAPE_INVALID_ANGLE_RANGE);
+    samples(c.scale_min, c.scale_max, c.scale_step, .25, 2, VF_SHAPE_INVALID_SCALE_RANGE);
+}
+
+// 训练像素总量上限（预算公式 v1；账本口径与训练拒绝同一常量）
+constexpr uint64_t kMaxTrainingPixels = 250000000;
+
+vf_shape_budget_report account_training(const vf_shape_train_config& c, int width, int height) {
+    (void)width; (void)height;  // 预留：账本公式后续版本可加入图像相关约束
+    vf_shape_budget_report report{};
+    report.struct_size = sizeof(report);
+    report.formula_version = 1;
+    const auto angles = samples(c.angle_min, c.angle_max, c.angle_step, -180, 180,
+                                VF_SHAPE_INVALID_ANGLE_RANGE);
+    const auto scales = samples(c.scale_min, c.scale_max, c.scale_step, .25, 2,
+                                VF_SHAPE_INVALID_SCALE_RANGE);
+    report.pose_used = uint32_t(angles.size() * scales.size());
+    report.pose_limit = uint32_t(max_poses);
     uint64_t pixels = 0;
+    uint32_t canvas = 0;
     for (double scale : scales) {
         const int sw = cvRound(c.roi_width * scale), sh = cvRound(c.roi_height * scale);
         const int padding = int(std::ceil(std::max(sw, sh) * std::sqrt(2.) / 2.)) + 24;
         const int cw = sw + 2 * padding, ch = sh + 2 * padding;
-        require(cw <= max_edge && ch <= max_edge, "training canvas budget exceeded");
+        canvas = std::max(canvas, uint32_t(std::max(cw, ch)));
         pixels += uint64_t(cw) * ch * angles.size();
     }
-    require(pixels <= 250000000, "training pixel budget exceeded");
+    report.canvas_used = canvas;
+    report.canvas_limit = uint32_t(max_edge);
+    report.pixel_used = pixels;
+    report.pixel_limit = kMaxTrainingPixels;
+    report.pose_over = report.pose_used > report.pose_limit;
+    report.canvas_over = report.canvas_used > report.canvas_limit;
+    report.pixel_over = report.pixel_used > report.pixel_limit;
+    report.over_budget = report.pose_over
+                             ? int32_t(VF_SHAPE_POSE_BUDGET)
+                             : (report.canvas_over ? int32_t(VF_SHAPE_CANVAS_BUDGET)
+                                                   : (report.pixel_over ? int32_t(VF_SHAPE_PIXEL_BUDGET)
+                                                                        : int32_t(VF_SHAPE_OK)));
+    return report;
+}
+
+vf_shape_budget_report estimate_training(const vf_shape_train_config& c, int width, int height) {
+    validate_config_domain(c, width, height);
+    return account_training(c, width, height);
+}
+
+void validate_config(const vf_shape_train_config& c, int width, int height) {
+    validate_config_domain(c, width, height);
+    const auto report = account_training(c, width, height);
+    require_coded(report.pose_used <= report.pose_limit, VF_SHAPE_POSE_BUDGET,
+                  "pose budget exceeded", double(report.pose_used), double(report.pose_limit));
+    require_coded(report.canvas_used <= report.canvas_limit, VF_SHAPE_CANVAS_BUDGET,
+                  "training canvas budget exceeded", double(report.canvas_used),
+                  double(report.canvas_limit));
+    require_coded(report.pixel_used <= report.pixel_limit, VF_SHAPE_PIXEL_BUDGET,
+                  "training pixel budget exceeded", double(report.pixel_used),
+                  double(report.pixel_limit));
 }
 
 std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& c,
@@ -106,8 +176,10 @@ std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& 
     const auto tuning = validate_detector_params(c.feature_count, c.weak_th, c.strong_th);
     auto model = std::make_shared<Model>(tuning.features, tuning.weak, tuning.strong);
     model->config = c; model->width = image.cols; model->height = image.rows;
-    const auto angles = samples(c.angle_min, c.angle_max, c.angle_step, -180, 180, 360);
-    const auto scales = samples(c.scale_min, c.scale_max, c.scale_step, .25, 2);
+    const auto angles = samples(c.angle_min, c.angle_max, c.angle_step, -180, 180,
+                                VF_SHAPE_INVALID_ANGLE_RANGE, 360);
+    const auto scales = samples(c.scale_min, c.scale_max, c.scale_step, .25, 2,
+                                VF_SHAPE_INVALID_SCALE_RANGE);
     const auto crop = image(cv::Rect(c.roi_x, c.roi_y, c.roi_width, c.roi_height));
     for (double scale : scales) {
         cv::Mat scaled;
@@ -139,8 +211,9 @@ std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& 
             const int id = model->detector.addTemplate(rotated, "shape", rotated_mask);
             if (id < 0) continue;
             for (const auto& level : model->detector.getTemplates("shape", id))
-                require(level.features.size() >= 4 && level.features.size() <= max_features_per_level,
-                        "training feature budget exceeded");
+                require_coded(level.features.size() >= 4 && level.features.size() <= max_features_per_level,
+                              VF_SHAPE_DETECTOR_PARAMS, "training feature budget exceeded",
+                              double(level.features.size()), 4, double(max_features_per_level));
             Pose pose; pose.angle = angle; pose.scale = scale;
             pose.canvas_width = canvas.cols; pose.canvas_height = canvas.rows;
             for (int row = 0; row < 2; ++row) {
@@ -203,7 +276,8 @@ bool same_object(const vf_shape_candidate& a, const vf_shape_candidate& b) {
 }
 
 std::vector<vf_shape_candidate> match(Model& model, const cv::Mat& image, double threshold) {
-    require(std::isfinite(threshold) && threshold > 0 && threshold <= 100, "invalid similarity threshold");
+    require_coded(std::isfinite(threshold) && threshold > 0 && threshold <= 100,
+                  VF_SHAPE_THRESHOLD_INVALID, "invalid similarity threshold", threshold);
     validate_search_budget(model, image.cols, image.rows);
     // 帧准备必须用模型同参 detector（量化/特征选择同参，防静默错配）
     return match_prepared(model, prepare_frame(image, &model.detector), threshold);
@@ -212,8 +286,9 @@ std::vector<vf_shape_candidate> match(Model& model, const cv::Mat& image, double
 void validate_search_budget(const Model& model, int width, int height) {
     const int padded_width = (width + PreparedFrame::padding * 2 + 15) / 16 * 16;
     const int padded_height = (height + PreparedFrame::padding * 2 + 15) / 16 * 16;
-    require(uint64_t(padded_width / 16) * (padded_height / 16) * model.poses.size() <= 4000000,
-            "matching search budget exceeded");
+    const auto used = uint64_t(padded_width / 16) * (padded_height / 16) * model.poses.size();
+    require_coded(used <= 4000000, VF_SHAPE_SEARCH_BUDGET, "matching search budget exceeded",
+                  double(used), 4000000.0);
 }
 
 PreparedFrame prepare_frame(const cv::Mat& image, const Detector* detector) {
@@ -233,11 +308,14 @@ PreparedFrame prepare_frame(const cv::Mat& image, const Detector* detector) {
 constexpr double kAmbiguityScoreGap = 10.;
 
 std::vector<vf_shape_candidate> match_prepared(Model& model, const PreparedFrame& frame, double threshold) {
-    require(std::isfinite(threshold) && threshold > 0 && threshold <= 100, "invalid similarity threshold");
-    require(uint64_t(frame.padded_width / 16) * (frame.padded_height / 16) * model.poses.size() <= 4000000,
-            "matching search budget exceeded");
+    require_coded(std::isfinite(threshold) && threshold > 0 && threshold <= 100,
+                  VF_SHAPE_THRESHOLD_INVALID, "invalid similarity threshold", threshold);
+    const auto blocks = uint64_t(frame.padded_width / 16) * (frame.padded_height / 16) * model.poses.size();
+    require_coded(blocks <= 4000000, VF_SHAPE_SEARCH_BUDGET, "matching search budget exceeded",
+                  double(blocks), 4000000.0);
     auto hits = model.detector.matchPrepared(frame.features, float(threshold), {"shape"});
-    require(hits.size() <= 200000, "candidate budget exceeded");
+    require_coded(hits.size() <= 200000, VF_SHAPE_SEARCH_BUDGET, "candidate budget exceeded",
+                  double(hits.size()), 200000.0);
     std::vector<vf_shape_candidate> objects;
     uint64_t comparisons = 0;
     for (const auto& hit : hits) {
@@ -246,7 +324,8 @@ std::vector<vf_shape_candidate> match_prepared(Model& model, const PreparedFrame
             current.center[1] < 0 || current.center[1] >= frame.height) continue;
         bool merged = false;
         for (auto& object : objects) {
-            require(++comparisons <= 4000000, "candidate clustering budget exceeded");
+            require_coded(++comparisons <= 4000000, VF_SHAPE_SEARCH_BUDGET,
+                          "candidate clustering budget exceeded", double(comparisons), 4000000.0);
             if (!same_object(object, current)) continue;
             const double angle = std::abs(std::remainder(object.angle - current.angle, 360.));
             // 姿态差超限且两解分数接近（差 < kAmbiguityScoreGap）才是无法分辨的

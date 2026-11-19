@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #ifdef VF_SHAPE_PROFILE_STAGES
 #include <chrono>
 #include <cstdio>
@@ -9,6 +10,17 @@
 #endif
 
 namespace vfshape {
+
+// 匹配诊断快照（Plain 可复制载体，供 ABI 层落句柄档案）。
+// 计数常开零开销；毫秒字段仅 VF_SHAPE_PROFILE_STAGES 构建填充，常规为 0。
+struct MatchTraceSnapshot {
+    int coarse_candidates = 0;
+    int windows_searched = 0;
+    int final_candidates = 0;
+    std::array<double, 8> window_best{};
+    double coarse_ms = 0, coarse_resize_ms = 0, windows_ms = 0, finish_ms = 0;
+};
+
 class MatchProfile {
 public:
     struct Window {
@@ -17,6 +29,11 @@ public:
         int deferred_levels = 0;
     };
     std::array<Window, 2> windows;
+    // 常开计数：各精修窗最佳分（槽位上限 8，未执行窗为 0）；窗口 1 可能由
+    // 并行线程写入，与窗口 0 分属不同元素、互不竞争
+    std::array<double, 8> window_best{};
+    std::atomic<int> windows_searched{0};
+    int coarse_candidates = 0, final_candidates = 0;
     double coarse_ms = 0, coarse_resize_ms = 0, windows_ms = 0, finish_ms = 0;
     int count = 0;
 
@@ -44,6 +61,19 @@ public:
     static auto measure(double& target, Function&& function) {
         Timer timer(target);
         return function();
+    }
+
+    MatchTraceSnapshot snapshot() const {
+        MatchTraceSnapshot snap;
+        snap.coarse_candidates = coarse_candidates;
+        snap.windows_searched = windows_searched.load(std::memory_order_relaxed);
+        snap.final_candidates = final_candidates;
+        snap.window_best = window_best;
+        snap.coarse_ms = coarse_ms;
+        snap.coarse_resize_ms = coarse_resize_ms;
+        snap.windows_ms = windows_ms;
+        snap.finish_ms = finish_ms;
+        return snap;
     }
 
     ~MatchProfile() noexcept {

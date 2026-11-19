@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .diagnostics import last_match_info as _last_match_info
 from .native_library import (
     Candidate,
     NativeShapeError,
@@ -184,6 +185,10 @@ class NativeModel:
                 ct.byref(count),
             )
             return _candidates(output, count.value)
+
+    def last_match_info(self) -> dict:
+        """最近一次匹配的诊断快照（字段见 diagnostics.last_match_info）。"""
+        return _last_match_info(self)
 
     def close(self) -> None:
         with self._lock:

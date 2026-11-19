@@ -200,7 +200,7 @@ impl ShapeLibrary {
 
 }
 
-fn train_config_abi(
+pub(crate) fn train_config_abi(
     params: &TrainParams,
     feature_count: i32,
     weak_th: f64,

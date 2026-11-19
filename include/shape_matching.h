@@ -25,6 +25,9 @@ extern "C" {
  *   可程序化的错误分类。
  * - error 缓冲由调用方提供：库在入口清空它，写入按容量截断并保证 NUL
  *   结尾；error 为 NULL 或 capacity 为 0 时不写文本，错误仍以返回码表达。
+ * - 错误码：返回 1 的可报告失败大多附带稳定错误码（vf_shape_error_code）
+ *   与数值上下文，经 vf_shape_last_error_info 按线程查询；错误文本合同
+ *   不变，码与文本并存。返回 2 与未覆盖的失败按 INTERNAL 归类。
  *
  * 所有权与生命周期：
  * - 全部输入/输出缓冲由调用方分配并保证可写长度；库只在调用期间借用，
@@ -116,6 +119,66 @@ typedef struct {
     char error[256];
 } vf_shape_batch_item;
 
+/* 稳定错误码：与错误文本并存，供程序化分类与人话映射。语义为"哪类约束
+ * 被违反"，命名与既有错误文本关键词一一挂钩；未覆盖的失败按 INTERNAL。
+ * 码值经由 vf_shape_last_error_info 查询（线程局部，见该入口注释）。 */
+typedef enum {
+    VF_SHAPE_OK = 0,
+    VF_SHAPE_INVALID_IMAGE = 1,
+    VF_SHAPE_INVALID_ROI = 2,
+    VF_SHAPE_INVALID_ANGLE_RANGE = 3,
+    VF_SHAPE_INVALID_SCALE_RANGE = 4,
+    VF_SHAPE_POSE_BUDGET = 5,
+    VF_SHAPE_PIXEL_BUDGET = 6,
+    VF_SHAPE_CANVAS_BUDGET = 7,
+    VF_SHAPE_DETECTOR_PARAMS = 8,
+    VF_SHAPE_THRESHOLD_INVALID = 9,
+    VF_SHAPE_CAPACITY_INVALID = 10,
+    VF_SHAPE_HANDLE_INVALID = 11,
+    VF_SHAPE_HANDLE_BUDGET = 12,
+    VF_SHAPE_MODEL_FORMAT = 13,
+    VF_SHAPE_MODEL_SIZE = 14,
+    VF_SHAPE_MODEL_TAMPER = 15,
+    VF_SHAPE_SEARCH_BUDGET = 16,
+    VF_SHAPE_INTERNAL = 99
+} vf_shape_error_code;
+
+/* 训练预算账本（vf_shape_estimate_training 输出）。
+ * formula_version：预算公式版本，当前恒为 1；核算公式变化时递增。
+ * pose_used/pose_limit：角度×缩放档位总数与其上限（350）。
+ * canvas_used/canvas_limit：缩放后最大画布单边像素与其上限（4096）。
+ * pixel_used/pixel_limit：全部姿态画布像素总量与其上限（2.5e8）。
+ * pose_over/canvas_over/pixel_over：0/1，该账本是否超限；超限账本仍报告
+ *   实际用量。over_budget：首要超限因子，判定顺序与训练拒绝顺序一致
+ *   （POSE_BUDGET → CANVAS_BUDGET → PIXEL_BUDGET），未超限为 VF_SHAPE_OK。
+ */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t formula_version;
+    uint32_t pose_used, pose_limit, pose_over;
+    uint32_t canvas_used, canvas_limit, canvas_over;
+    uint32_t pixel_over;
+    uint64_t pixel_used, pixel_limit;
+    int32_t over_budget;
+} vf_shape_budget_report;
+
+/* 最近一次匹配的诊断快照（vf_shape_last_match_info 输出）。
+ * coarse_candidates：两级模型粗层命中数（预算截断前）；windows_searched：
+ *   实际执行精修的窗口数；window_best_scores：各精修窗最佳分（槽位上限
+ *   8，未执行窗为 0）；final_candidates：聚类过滤后的最终候选数（输出
+ *   容量截断前）。计数常开、零开销。
+ * coarse_ms/coarse_resize_ms/windows_ms/finish_ms：分阶段耗时（毫秒），
+ *   仅诊断计时构建（VF_SHAPE_PROFILE_STAGES）填充，常规构建恒为 0。
+ * 单级模型无两级编排：仅 final_candidates 有效，其余为 0。句柄尚未执行
+ * 过匹配时全部字段为 0（struct_size 回显除外）。
+ */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t coarse_candidates, windows_searched, final_candidates;
+    double window_best_scores[8];
+    double coarse_ms, coarse_resize_ms, windows_ms, finish_ms;
+} vf_shape_match_trace;
+
 /* 返回 ABI 版本（当前为 3）。版本协商入口，无失败路径。 */
 VF_SHAPE_API uint32_t vf_shape_abi_version(void);
 
@@ -164,6 +227,29 @@ VF_SHAPE_API int32_t vf_shape_close(uint64_t handle, char* error, uint32_t error
 VF_SHAPE_API int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_size,
     int32_t width, int32_t height, uint64_t stride, vf_shape_batch_item* items,
     uint32_t item_count, uint32_t item_size, char* error, uint32_t error_capacity);
+
+/* 查询本线程最近一次失败调用的错误码与数值参数。code/params/param_count
+ * 均可为 NULL 跳过对应输出；params 前 param_count（0..6）项有效，语义随
+ * 错误码与检查点不同（如角度步长过细时依次为：当前步长、档数上限、建议
+ * 步长）。成功调用不清除上次记录（跨调用仍可查询）；记录每线程独立，
+ * 跨线程不可见；本线程无失败历史时 code 为 VF_SHAPE_OK。 */
+VF_SHAPE_API void vf_shape_last_error_info(int32_t* code, double params[6],
+    int32_t* param_count);
+
+/* 训练预算查询：按训练同一公式核算配置将占用的姿态数、最大画布与像素
+ * 总量。纯计算，不建句柄不碰图像。config->struct_size 与 out->struct_size
+ * 须先置为 sizeof。配置域检查（结构尺寸/Detector 三参/ROI/角度缩放范围）
+ * 与训练同判：不合法返回 1 并写错误文本；合法配置返回 0，*out 报告用量
+ * 与首要超限因子（超限本身不算查询失败，见 vf_shape_budget_report）。 */
+VF_SHAPE_API int32_t vf_shape_estimate_training(const vf_shape_train_config* config,
+    int32_t image_w, int32_t image_h, vf_shape_budget_report* out,
+    char* error, uint32_t error_capacity);
+
+/* 查询句柄最近一次 match/match_batch 的诊断快照。非阻塞快照：句柄锁下
+ * 读取，与在途匹配串行。out->struct_size 须先置为 sizeof，返回后库按其
+ * 回显。返回码分层同文件头。 */
+VF_SHAPE_API int32_t vf_shape_last_match_info(uint64_t handle,
+    vf_shape_match_trace* out, char* error, uint32_t error_capacity);
 
 #ifdef __cplusplus
 }

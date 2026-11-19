@@ -1,5 +1,6 @@
 #include "model.hpp"
 #include "two_stage.hpp"
+#include "matching_profile.hpp"
 #include <algorithm>
 #include <cstring>
 #include <cmath>
@@ -17,6 +18,8 @@ struct ModelHolder {
     std::shared_ptr<vfshape::Model> single;            // 单级（旧格式资产）
     std::shared_ptr<vfshape::TwoStageModel> two_stage; // 两级容器（VF2S3）
     std::mutex mutex;
+    vf_shape_match_trace last_trace{};                 // 最近一次 match/batch 诊断快照
+    ModelHolder() { last_trace.struct_size = sizeof(vf_shape_match_trace); }
 };
 std::unordered_map<uint64_t, std::shared_ptr<ModelHolder>> registry;
 uint64_t next_handle = 1;
@@ -30,14 +33,36 @@ void copy_error(char* dest, size_t dest_size, const char* message) {
 template<class Function>
 int32_t boundary(char* error, uint32_t capacity, Function&& body) noexcept {
     if (error && capacity) error[0] = '\0';
+    const uint64_t scope = vfshape::begin_error_scope();
     try { body(); return 0; }
     catch (const std::exception& ex) {
+        vfshape::finish_error_scope(scope);
         if (error && capacity) copy_error(error, capacity, ex.what());
         return 1;
     } catch (...) {
+        vfshape::finish_error_scope(scope);
         if (error && capacity) copy_error(error, capacity, "unknown native matching failure");
         return 2;
     }
+}
+
+// 诊断快照落句柄档案（单级无两级编排：仅最终候选数有效，其余恒 0）
+void store_two_stage_trace(ModelHolder& holder, const vfshape::MatchTraceSnapshot& snap) {
+    holder.last_trace.struct_size = sizeof(vf_shape_match_trace);
+    holder.last_trace.coarse_candidates = uint32_t(std::max(0, snap.coarse_candidates));
+    holder.last_trace.windows_searched = uint32_t(std::max(0, snap.windows_searched));
+    holder.last_trace.final_candidates = uint32_t(std::max(0, snap.final_candidates));
+    std::copy_n(snap.window_best.begin(), 8, holder.last_trace.window_best_scores);
+    holder.last_trace.coarse_ms = snap.coarse_ms;
+    holder.last_trace.coarse_resize_ms = snap.coarse_resize_ms;
+    holder.last_trace.windows_ms = snap.windows_ms;
+    holder.last_trace.finish_ms = snap.finish_ms;
+}
+void store_single_trace(ModelHolder& holder, size_t final_count) {
+    const uint32_t struct_size = holder.last_trace.struct_size;
+    holder.last_trace = vf_shape_match_trace{};
+    holder.last_trace.struct_size = struct_size;
+    holder.last_trace.final_candidates = uint32_t(final_count);
 }
 
 // 批量备帧累计预算按填充后像素计价：每帧常驻约 5.75B/px（两层源图金字塔
@@ -56,12 +81,15 @@ uint64_t padded_frame_pixels(int width, int height) {
 std::shared_ptr<ModelHolder> get(uint64_t handle) {
     std::lock_guard<std::mutex> lock(registry_mutex);
     auto found = registry.find(handle);
-    vfshape::require(found != registry.end(), "model handle is closed or unknown");
+    vfshape::require_coded(found != registry.end(), VF_SHAPE_HANDLE_INVALID,
+                           "model handle is closed or unknown", double(handle));
     return found->second;
 }
 void put(std::shared_ptr<ModelHolder> model, uint64_t* handle) {
     std::lock_guard<std::mutex> lock(registry_mutex);
-    vfshape::require(registry.size() < max_handles && next_handle != 0, "native handle budget exceeded");
+    vfshape::require_coded(registry.size() < max_handles && next_handle != 0,
+                           VF_SHAPE_HANDLE_BUDGET, "native handle budget exceeded",
+                           double(registry.size()), double(max_handles));
     *handle = next_handle++; registry.emplace(*handle, std::move(model));
 }
 }
@@ -83,8 +111,9 @@ int32_t vf_shape_load(const uint8_t* bytes, uint64_t size, uint64_t* handle, cha
         auto holder = std::make_shared<ModelHolder>();
         holder->two_stage = vfshape::decode_two_stage(bytes, size);
         if (!holder->two_stage) holder->single = vfshape::decode(bytes, size);
-        vfshape::require(holder->single || holder->two_stage,
-                         "model is neither two-stage container nor single-level format");
+        vfshape::require_coded(holder->single || holder->two_stage,
+                               VF_SHAPE_MODEL_FORMAT,
+                               "model is neither two-stage container nor single-level format");
         put(std::move(holder), handle);
     });
 }
@@ -110,14 +139,21 @@ int32_t vf_shape_match(uint64_t handle, const uint8_t* image, uint64_t image_siz
     return boundary(error, error_capacity, [&] {
         vfshape::require(count, "missing candidate count output");
         *count = 0;
-        vfshape::require(candidates && capacity >= 2 && capacity <= 256, "candidate capacity must be 2..256");
+        vfshape::require_coded(candidates && capacity >= 2 && capacity <= 256,
+                               VF_SHAPE_CAPACITY_INVALID, "candidate capacity must be 2..256",
+                               double(capacity), 2.0, 256.0);
         const auto frame = vfshape::checked_image(image, image_size, width, height, stride);
         auto model = get(handle); std::lock_guard<std::mutex> lock(model->mutex);
         std::vector<vf_shape_candidate> found;
-        if (model->two_stage)
-            found = vfshape::match_two_stage(*model->two_stage, frame, threshold, capacity);
-        else
+        if (model->two_stage) {
+            vfshape::MatchTraceSnapshot snap;
+            found = vfshape::match_two_stage(*model->two_stage, frame, threshold,
+                                             int(capacity), &snap);
+            store_two_stage_trace(*model, snap);
+        } else {
             found = vfshape::match(*model->single, frame, threshold);
+            store_single_trace(*model, found.size());
+        }
         *count = uint32_t(std::min(size_t(capacity), found.size()));
         std::copy_n(found.begin(), *count, candidates);
     });
@@ -156,10 +192,12 @@ int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_size, int32_t 
         for (uint32_t n = 0; n < item_count; ++n) {
             auto& item = items[n];
             item.status = boundary(item.error, sizeof(item.error), [&] {
-                vfshape::require(item.candidates && item.capacity >= 2 && item.capacity <= 256,
-                    "candidate capacity must be 2..256");
-                vfshape::require(std::isfinite(item.threshold) && item.threshold > 0 && item.threshold <= 100,
-                    "invalid similarity threshold");
+                vfshape::require_coded(item.candidates && item.capacity >= 2 && item.capacity <= 256,
+                    VF_SHAPE_CAPACITY_INVALID, "candidate capacity must be 2..256",
+                    double(item.capacity), 2.0, 256.0);
+                vfshape::require_coded(std::isfinite(item.threshold) && item.threshold > 0 &&
+                    item.threshold <= 100, VF_SHAPE_THRESHOLD_INVALID,
+                    "invalid similarity threshold", item.threshold);
                 auto model = get(item.handle);
                 // 搜索预算仅约束单级共享帧匹配；两级匹配内部自管缩图与窗口预算
                 if (model->single)
@@ -195,6 +233,9 @@ int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_size, int32_t 
                                        detector.tuned_strong);
             if (frames.count(key) || failed_groups.count(key)) continue;
             if (prepared_pixels + frame_pixels > kMaxBatchPreparedPixels) {
+                vfshape::record_error(VF_SHAPE_PIXEL_BUDGET,
+                                      {double(kMaxBatchPreparedPixels),
+                                       double(prepared_pixels), double(frame_pixels)});
                 const auto message = "batch prepared-frame pixel budget exceeded: budget "
                     + std::to_string(kMaxBatchPreparedPixels) + " pixels, prepared "
                     + std::to_string(prepared_pixels) + " pixels, frame "
@@ -228,13 +269,16 @@ int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_size, int32_t 
                 std::lock_guard<std::mutex> lock(models[n]->mutex);
                 std::vector<vf_shape_candidate> found;
                 if (models[n]->two_stage) {
+                    vfshape::MatchTraceSnapshot snap;
                     found = vfshape::match_two_stage(*models[n]->two_stage, image_view,
-                                                     item.threshold, int(item.capacity));
+                                                     item.threshold, int(item.capacity), &snap);
+                    store_two_stage_trace(*models[n], snap);
                 } else {
                     const auto& detector = models[n]->single->detector;
                     const auto& frame = frames.find(std::make_tuple(
                         detector.tuned_features, detector.tuned_weak, detector.tuned_strong))->second;
                     found = vfshape::match_prepared(*models[n]->single, frame, item.threshold);
+                    store_single_trace(*models[n], found.size());
                 }
                 item.count = uint32_t(std::min(size_t(item.capacity), found.size()));
                 std::copy_n(found.begin(), item.count, item.candidates);
@@ -246,5 +290,29 @@ int32_t vf_shape_close(uint64_t handle, char* error, uint32_t capacity) {
     return boundary(error, capacity, [&] {
         std::lock_guard<std::mutex> lock(registry_mutex);
         registry.erase(handle);
+    });
+}
+void vf_shape_last_error_info(int32_t* code, double params[6], int32_t* param_count) {
+    if (code) *code = vfshape::g_last_error.code;
+    if (param_count) *param_count = vfshape::g_last_error.param_count;
+    if (params)
+        std::copy_n(vfshape::g_last_error.params, 6, params);
+}
+int32_t vf_shape_estimate_training(const vf_shape_train_config* config, int32_t image_w,
+    int32_t image_h, vf_shape_budget_report* out, char* error, uint32_t capacity) {
+    return boundary(error, capacity, [&] {
+        vfshape::require(config && out, "missing budget report output/config");
+        vfshape::require(out->struct_size == sizeof(*out), "invalid budget report output ABI");
+        *out = vfshape::estimate_training(*config, image_w, image_h);
+    });
+}
+int32_t vf_shape_last_match_info(uint64_t handle, vf_shape_match_trace* out,
+    char* error, uint32_t capacity) {
+    return boundary(error, capacity, [&] {
+        vfshape::require(out, "missing match trace output");
+        vfshape::require(out->struct_size == sizeof(*out), "invalid match trace output ABI");
+        auto model = get(handle);
+        std::lock_guard<std::mutex> lock(model->mutex);
+        *out = model->last_trace;
     });
 }

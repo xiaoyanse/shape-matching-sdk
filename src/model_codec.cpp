@@ -26,20 +26,21 @@ class Reader {
 public:
     Reader(const uint8_t* bytes, uint64_t size) : bytes_(bytes), size_(size) {}
     uint32_t integer() {
-        require(size_ - position_ >= 4, "truncated model");
+        require_coded(size_ - position_ >= 4, VF_SHAPE_MODEL_TAMPER, "truncated model");
         uint32_t value = 0;
         for (int shift = 0; shift < 32; shift += 8) value |= uint32_t(bytes_[position_++]) << shift;
         return value;
     }
     int bounded(int low, int high) {
         const auto value = integer();
-        require(value >= uint32_t(low) && value <= uint32_t(high), "model integer outside bounds");
+        require_coded(value >= uint32_t(low) && value <= uint32_t(high), VF_SHAPE_MODEL_TAMPER,
+                      "model integer outside bounds");
         return int(value);
     }
     double number() {
         uint64_t bits = integer(); bits |= uint64_t(integer()) << 32;
         double value; std::memcpy(&value, &bits, sizeof(value));
-        require(std::isfinite(value), "non-finite model number");
+        require_coded(std::isfinite(value), VF_SHAPE_MODEL_TAMPER, "non-finite model number");
         return value;
     }
     bool finished() const { return position_ == size_; }
@@ -91,15 +92,20 @@ std::vector<uint8_t> encode(const Model& model) {
         }
     }
     out.bytes.insert(out.bytes.begin(), signature, signature + sizeof(signature));
-    require(out.bytes.size() <= max_model_bytes, "model byte budget exceeded");
+    require_coded(out.bytes.size() <= max_model_bytes, VF_SHAPE_MODEL_SIZE,
+                  "model byte budget exceeded", double(out.bytes.size()),
+                  double(max_model_bytes));
     return std::move(out.bytes);
 }
 
 std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size) {
-    require(bytes && size > sizeof(signature) && size <= max_model_bytes, "invalid model size");
-    require(std::memcmp(bytes, signature, sizeof(signature)) == 0, "unsupported model source/format");
+    require_coded(bytes && size > sizeof(signature) && size <= max_model_bytes,
+                  VF_SHAPE_MODEL_SIZE, "invalid model size", double(size),
+                  double(max_model_bytes));
+    require_coded(std::memcmp(bytes, signature, sizeof(signature)) == 0,
+                  VF_SHAPE_MODEL_FORMAT, "unsupported model source/format");
     Reader in(bytes + sizeof(signature), size - sizeof(signature));
-    require(in.integer() == 1, "unsupported model schema");
+    require_coded(in.integer() == 1, VF_SHAPE_MODEL_FORMAT, "unsupported model schema");
     const int dec_width = in.bounded(24, max_edge), dec_height = in.bounded(24, max_edge);
     auto config = read_config(in);
     validate_config(config, dec_width, dec_height);
@@ -113,27 +119,34 @@ std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size) {
     model->config.weak_th = tuning.weak;
     model->config.strong_th = tuning.strong;
     const auto angles = samples(model->config.angle_min, model->config.angle_max,
-                               model->config.angle_step, -180, 180);
+                               model->config.angle_step, -180, 180,
+                               VF_SHAPE_INVALID_ANGLE_RANGE);
     const auto scales = samples(model->config.scale_min, model->config.scale_max,
-                               model->config.scale_step, .25, 2);
+                               model->config.scale_step, .25, 2, VF_SHAPE_INVALID_SCALE_RANGE);
     const int count = in.bounded(1, max_poses);
-    require(size_t(count) <= angles.size() * scales.size(), "pose count exceeds training grid");
-    require(size >= uint64_t(count) * 140, "truncated pose collection");
+    require_coded(size_t(count) <= angles.size() * scales.size(), VF_SHAPE_MODEL_TAMPER,
+                  "pose count exceeds training grid", double(count),
+                  double(angles.size() * scales.size()));
+    require_coded(size >= uint64_t(count) * 140, VF_SHAPE_MODEL_TAMPER,
+                  "truncated pose collection", double(size),
+                  double(uint64_t(count) * 140));
     std::vector<std::pair<int, int>> seen;
     for (int id = 0; id < count; ++id) {
         Pose pose;
         pose.angle = in.number(); pose.scale = in.number();
         const int ai = grid_index(angles, pose.angle), si = grid_index(scales, pose.scale);
-        require(ai >= 0 && si >= 0, "pose outside training grid");
-        for (const auto& old : seen) require(old != std::make_pair(ai, si), "duplicate pose grid index");
+        require_coded(ai >= 0 && si >= 0, VF_SHAPE_MODEL_TAMPER, "pose outside training grid");
+        for (const auto& old : seen)
+            require_coded(old != std::make_pair(ai, si), VF_SHAPE_MODEL_TAMPER,
+                          "duplicate pose grid index");
         seen.emplace_back(ai, si);
         pose.canvas_width = in.bounded(24, max_edge); pose.canvas_height = in.bounded(24, max_edge);
         for (auto& value : pose.transform) value = in.number();
         const auto& c = model->config;
         const int sw = cvRound(c.roi_width * pose.scale), sh = cvRound(c.roi_height * pose.scale);
         const int padding = int(std::ceil(std::max(sw, sh) * std::sqrt(2.) / 2.)) + 24;
-        require(pose.canvas_width == sw + padding * 2 && pose.canvas_height == sh + padding * 2,
-                "invalid pose canvas");
+        require_coded(pose.canvas_width == sw + padding * 2 && pose.canvas_height == sh + padding * 2,
+                      VF_SHAPE_MODEL_TAMPER, "invalid pose canvas");
         const auto rotation = cv::getRotationMatrix2D(
             cv::Point2f(pose.canvas_width / 2.f, pose.canvas_height / 2.f), pose.angle, 1);
         for (int row = 0; row < 2; ++row) {
@@ -142,38 +155,40 @@ std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size) {
                 rotation.at<double>(row, 2) + a * (padding - double(sw) * c.roi_x / c.roi_width)
                 + b * (padding - double(sh) * c.roi_y / c.roi_height)};
             for (int col = 0; col < 3; ++col)
-                require(std::abs(pose.transform[row * 3 + col] - expected[col]) < 1e-6,
-                        "pose transform disagrees with reference geometry");
+                require_coded(std::abs(pose.transform[row * 3 + col] - expected[col]) < 1e-6,
+                              VF_SHAPE_MODEL_TAMPER,
+                              "pose transform disagrees with reference geometry");
         }
-        require(in.integer() == 2, "invalid pyramid depth");
+        require_coded(in.integer() == 2, VF_SHAPE_MODEL_TAMPER, "invalid pyramid depth");
         std::vector<line2Dup::Template> pyramid;
         for (int level = 0; level < 2; ++level) {
             line2Dup::Template item{};
             const int cw = pose.canvas_width >> level, ch = pose.canvas_height >> level;
             item.width = in.bounded(1, cw); item.height = in.bounded(1, ch);
             item.tl_x = in.bounded(0, cw); item.tl_y = in.bounded(0, ch);
-            require(item.width + item.tl_x <= cw && item.height + item.tl_y <= ch,
-                    "template rectangle outside canvas");
+            require_coded(item.width + item.tl_x <= cw && item.height + item.tl_y <= ch,
+                          VF_SHAPE_MODEL_TAMPER, "template rectangle outside canvas");
             item.pyramid_level = in.bounded(level, level);
             if (level) {
                 const auto& base = pyramid.front();
-                require(item.width == (base.width >> level) && item.height == (base.height >> level)
-                        && item.tl_x == (base.tl_x >> level) && item.tl_y == (base.tl_y >> level),
-                        "inconsistent pyramid geometry");
+                require_coded(item.width == (base.width >> level) && item.height == (base.height >> level)
+                              && item.tl_x == (base.tl_x >> level) && item.tl_y == (base.tl_y >> level),
+                              VF_SHAPE_MODEL_TAMPER, "inconsistent pyramid geometry");
             }
             const int features = in.bounded(4, max_features_per_level);
             for (int n = 0; n < features; ++n) {
                 line2Dup::Feature f;
                 f.x = in.bounded(0, item.width); f.y = in.bounded(0, item.height);
                 f.label = in.bounded(0, 7); f.theta = float(in.number());
-                require(f.theta >= 0 && f.theta <= 360, "invalid feature orientation");
+                require_coded(f.theta >= 0 && f.theta <= 360, VF_SHAPE_MODEL_TAMPER,
+                              "invalid feature orientation");
                 item.features.push_back(f);
             }
             pyramid.push_back(std::move(item));
         }
         model->poses.push_back(pose); model->detector.append(std::move(pyramid));
     }
-    require(in.finished(), "model trailing bytes");
+    require_coded(in.finished(), VF_SHAPE_MODEL_TAMPER, "model trailing bytes");
     // 角度插值未消费，解码侧不回填 adjacency（邻居计算跳过）。
     // model->build_pose_adjacency();
     return model;
