@@ -10,7 +10,7 @@ find_package(Threads REQUIRED)
 add_library(visionforge_shape SHARED
     src/abi.cpp src/model_codec.cpp src/matcher.cpp src/polygon.cpp src/two_stage.cpp
     src/two_stage_train.cpp src/container_codec.cpp src/geometric_refinement.cpp
-    src/coarse_image.cpp vendor/shape_based_matching/line2Dup.cpp)
+    src/audit.cpp src/coarse_image.cpp vendor/shape_based_matching/line2Dup.cpp)
 target_include_directories(visionforge_shape PRIVATE include src ${OpenCV_INCLUDE_DIRS}
     vendor/shape_based_matching vendor/shape_based_matching/MIPP)
 target_link_libraries(visionforge_shape PRIVATE ${OpenCV_LIBS} Threads::Threads)
@@ -93,6 +93,14 @@ if(VF_SHAPE_BUILD_TESTS)
         target_compile_options(shape_diagnostics_test PRIVATE /utf-8 /EHsc)
     endif()
     add_test(NAME shape_diagnostics COMMAND shape_diagnostics_test)
+    add_executable(shape_audit_test tests/audit_test.cpp)
+    target_include_directories(shape_audit_test PRIVATE include tests ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(shape_audit_test PRIVATE visionforge_shape ${OpenCV_LIBS}
+        Threads::Threads)
+    if(MSVC)
+        target_compile_options(shape_audit_test PRIVATE /utf-8 /EHsc)
+    endif()
+    add_test(NAME shape_audit COMMAND shape_audit_test)
     add_executable(shape_polygon_test tests/polygon_test.cpp)
     target_include_directories(shape_polygon_test PRIVATE include tests ${OpenCV_INCLUDE_DIRS})
     target_link_libraries(shape_polygon_test PRIVATE visionforge_shape ${OpenCV_LIBS}
@@ -125,7 +133,7 @@ if(VF_SHAPE_BUILD_TESTS)
     # 形态触达决策人桌面——常设纪律）。bin 与 OpenCV_DIR(lib) 同级。
     set(VF_TEST_ENV "PATH=${OpenCV_DIR}/../bin\\;$ENV{PATH}")
     set_tests_properties(shape_geometry shape_frame shape_coarse_image shape_clustering
-        shape_abi_chain shape_abi_tamper shape_diagnostics shape_polygon shape_polygon_mask
-        shape_witness
+        shape_abi_chain shape_abi_tamper shape_diagnostics shape_audit shape_polygon
+        shape_polygon_mask shape_witness
         PROPERTIES ENVIRONMENT "${VF_TEST_ENV}")
 endif()

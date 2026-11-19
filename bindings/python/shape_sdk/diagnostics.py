@@ -9,20 +9,28 @@ from __future__ import annotations
 import ctypes as ct
 
 from .native_library import (
+    AuditReport,
     BudgetReport,
+    HealthReport,
     MatchTrace,
     NativeShapeError,
     TrainConfig,
+    image_args as _image_args,
     invoke,
     load_library,
 )
 
 __all__ = [
+    "AUDIT_CONFIDENCE",
+    "AUDIT_FLAGS",
     "ERROR_CODES",
+    "HEALTH_VERDICTS",
+    "audit_discriminability",
     "error_message",
     "estimate_training",
     "last_error_info",
     "last_match_info",
+    "model_health",
 ]
 
 OK = 0
@@ -43,6 +51,8 @@ MODEL_SIZE = 14
 MODEL_TAMPER = 15
 SEARCH_BUDGET = 16
 INVALID_POLYGON = 17
+INSUFFICIENT_FEATURES = 18
+COARSE_TRAIN_FAILED = 19
 INTERNAL = 99
 
 ERROR_CODES = {
@@ -64,6 +74,8 @@ ERROR_CODES = {
     "MODEL_TAMPER": MODEL_TAMPER,
     "SEARCH_BUDGET": SEARCH_BUDGET,
     "INVALID_POLYGON": INVALID_POLYGON,
+    "INSUFFICIENT_FEATURES": INSUFFICIENT_FEATURES,
+    "COARSE_TRAIN_FAILED": COARSE_TRAIN_FAILED,
     "INTERNAL": INTERNAL,
 }
 
@@ -89,6 +101,10 @@ _CODE_MESSAGES = {
     SEARCH_BUDGET: "匹配搜索预算超限：姿态数×搜索块数过多（参数：用量,上限）",
     INVALID_POLYGON: "多边形训练参数非法：顶点 3–64 且在图域内、无自交；洞 ≤8、"
     "每洞面积 ≥64px² 且完全在外环内（参数：细分类型,主参数,次参数）",
+    INSUFFICIENT_FEATURES: "参考 ROI 内边缘特征不足：训练未产生任何姿态模板，"
+    "请放宽 ROI、提高对比度或降低阈值参数（参数：特征数下限）",
+    COARSE_TRAIN_FAILED: "两级容器粗层训练在全部 K 档失败：ROI 过小或缩放档位"
+    "无法满足粗层合同（参数：尝试的 K 档数）",
     INTERNAL: "未分类内部错误",
 }
 
@@ -191,4 +207,131 @@ def last_match_info(model) -> dict:
             "coarse_resize_ms": trace.coarse_resize_ms,
             "windows_ms": trace.windows_ms,
             "finish_ms": trace.finish_ms,
+        }
+
+
+HEALTH_VERDICTS = {"HEALTHY": 0, "DEGRADED": 1, "WEAK": 2}
+AUDIT_FLAGS = {"RECOMMENDED": 0, "INSEPARABLE": 1, "NO_NEGATIVE": 2}
+AUDIT_CONFIDENCE = {"HIGH": 0, "LOW": 1}
+
+_VERDICT_TEXT = {
+    0: "健康：结构与自匹配均在正常范围",
+    1: "降级：自匹配分 <90 或存在特征数 <8 的层，建议复核模板质量",
+    2: "薄弱：自匹配分 <70 或特征数触 4 下限，不建议直接投入使用",
+}
+_FLAG_TEXT = {
+    0: "可推荐：正负分数可分，推荐区间可用（建议性）",
+    1: "不可分离：正负分数重叠（lo>hi），区间字段仅为计算中间值",
+    2: "无负样本：仅报告正组分布，未推荐阈值",
+}
+_CONFIDENCE_TEXT = {0: "高（两组有效样本均 ≥5）", 1: "低（任一组有效样本 <5）"}
+
+
+def _require_audit(library) -> None:
+    if not getattr(library, "_audit_exports", False):
+        raise NativeShapeError(
+            "模板匹配原生组件缺少体检/审计导出（model_health/audit_discriminability，"
+            "旧运行时），请升级制品后使用体检与审计接口"
+        )
+
+
+def model_health(model) -> dict:
+    """模型健康体检（零输入）：结构量+容器模板图自匹配分与分级。
+
+    verdict 0/1/2=HEALTHY/DEGRADED/WEAK（verdict_text 为人话）；单级旧资产
+    无容器模板图，self_score_valid=False 且自匹配项不参与分级。
+    """
+    with model._lock:
+        model._require_open()
+        library = model._library
+        _require_audit(library)
+        report = HealthReport()
+        report.struct_size = ct.sizeof(HealthReport)
+        invoke(library, "model_health", model._handle, ct.byref(report))
+        return {
+            "verdict": report.verdict,
+            "verdict_text": _VERDICT_TEXT.get(report.verdict, f"未知分级 {report.verdict}"),
+            "pose_count": report.pose_count,
+            "fine_min_features": report.fine_min_features,
+            "fine_max_features": report.fine_max_features,
+            "coarse_features": report.coarse_features,
+            "detector_features": report.detector_features,
+            "detector_weak": report.detector_weak,
+            "detector_strong": report.detector_strong,
+            "self_score": report.self_score,
+            "self_score_valid": bool(report.self_score_valid),
+            "template_width": report.template_width,
+            "template_height": report.template_height,
+        }
+
+
+def _audit_group_args(images, label: str) -> tuple:
+    """同组图像校验（同宽高）并构建指针数组：返回 (数组, 宽, 高, 步长)。"""
+    width = height = 0
+    pointers = (ct.c_void_p * len(images))()
+    for index, image in enumerate(images):
+        data_ptr, _, w, h, stride = _image_args(image)
+        if index == 0:
+            width, height = w, h
+        elif (w, h) != (width, height):
+            raise NativeShapeError(f"{label}图像须同宽高")
+        pointers[index] = data_ptr
+    return pointers, width, height, stride
+
+
+def audit_discriminability(model, pos_images, neg_images=None) -> dict:
+    """区分度审计与建议性阈值推荐（advisory）：正/负组逐帧最高分分布+推荐区间。
+
+    pos_images 至少 1 帧；neg_images 可选（None/空时只报正组分布，
+    flag=NO_NEGATIVE，不推荐区间）。同组图像须同宽高（连续 uint8 BGR）。
+    flag 0/1/2=RECOMMENDED/INSEPARABLE/NO_NEGATIVE；recommend 区间为统计
+    建议（lo=max(30, neg_max+5)、hi=min(85, pos_p25−5)），消费方按场景调整。
+    """
+    pos = list(pos_images)
+    if not pos:
+        raise NativeShapeError("正组图像至少 1 帧")
+    neg = list(neg_images) if neg_images else []
+    pos_args = _audit_group_args(pos, "正组")
+    if neg:
+        neg_args = _audit_group_args(neg, "负组")
+    else:
+        neg_args = ((ct.c_void_p * 0)(), 0, 0, 0)
+    with model._lock:
+        model._require_open()
+        library = model._library
+        _require_audit(library)
+        report = AuditReport()
+        report.struct_size = ct.sizeof(AuditReport)
+        invoke(
+            library,
+            "audit_discriminability",
+            model._handle,
+            pos_args[0], pos_args[1], pos_args[2], pos_args[3], len(pos),
+            neg_args[0], neg_args[1], neg_args[2], neg_args[3], len(neg),
+            ct.byref(report),
+        )
+        return {
+            "flag": report.flag,
+            "flag_text": _FLAG_TEXT.get(report.flag, f"未知结论 {report.flag}"),
+            "confidence": report.confidence,
+            "confidence_text": _CONFIDENCE_TEXT.get(
+                report.confidence, f"未知置信度 {report.confidence}"
+            ),
+            "pos_count": report.pos_count,
+            "pos_zero_hits": report.pos_zero_hits,
+            "pos_min": report.pos_min,
+            "pos_p25": report.pos_p25,
+            "pos_median": report.pos_median,
+            "pos_p75": report.pos_p75,
+            "pos_max": report.pos_max,
+            "neg_count": report.neg_count,
+            "neg_zero_hits": report.neg_zero_hits,
+            "neg_min": report.neg_min,
+            "neg_p25": report.neg_p25,
+            "neg_median": report.neg_median,
+            "neg_p75": report.neg_p75,
+            "neg_max": report.neg_max,
+            "separation": report.separation,
+            "recommend_lo": report.recommend_lo,
+            "recommend_hi": report.recommend_hi,
         }

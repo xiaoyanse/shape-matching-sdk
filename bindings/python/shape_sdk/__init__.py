@@ -6,11 +6,16 @@ visionforge_shape.dll 与 runtime-manifest.json），默认仓内 dist/runtime�
 """
 
 from .diagnostics import (
+    AUDIT_CONFIDENCE,
+    AUDIT_FLAGS,
     ERROR_CODES,
+    HEALTH_VERDICTS,
+    audit_discriminability,
     error_message,
     estimate_training,
     last_error_info,
     last_match_info,
+    model_health,
 )
 from .native import (
     NativeCandidate,
@@ -21,9 +26,11 @@ from .native import (
 )
 from .native_batch import match_batch
 from .native_library import (
+    AuditReport,
     BatchItem,
     BudgetReport,
     Candidate,
+    HealthReport,
     MatchTrace,
     NativeShapeError,
     Polygon,
@@ -36,10 +43,15 @@ from .native_library import (
 )
 
 __all__ = [
+    "AuditReport",
+    "AUDIT_CONFIDENCE",
+    "AUDIT_FLAGS",
     "BatchItem",
     "BudgetReport",
     "Candidate",
     "ERROR_CODES",
+    "HEALTH_VERDICTS",
+    "HealthReport",
     "MatchTrace",
     "NativeCandidate",
     "NativeModel",
@@ -48,6 +60,7 @@ __all__ = [
     "PolygonTrainParams",
     "TrainConfig",
     "Vertex",
+    "audit_discriminability",
     "error_message",
     "estimate_training",
     "invoke",
@@ -55,6 +68,7 @@ __all__ = [
     "last_match_info",
     "load_library",
     "match_batch",
+    "model_health",
     "runtime_directory",
     "suggest_contours",
     "train_model",

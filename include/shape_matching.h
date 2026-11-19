@@ -188,6 +188,11 @@ typedef enum {
      * 8=洞未完全在外环内（主=洞下标）；
      * 9=外接矩形违反 24..4096 合同（主=宽，次=高）。 */
     VF_SHAPE_INVALID_POLYGON = 17,
+    /* 内容类训练失败：参考 ROI 内边缘特征不足，姿态模板数为空（params：
+     * 特征数下限 4）。 */
+    VF_SHAPE_INSUFFICIENT_FEATURES = 18,
+    /* 两级容器粗层训练在全部 K 档失败（params：实际尝试的 K 档数）。 */
+    VF_SHAPE_COARSE_TRAIN_FAILED = 19,
     VF_SHAPE_INTERNAL = 99
 } vf_shape_error_code;
 
@@ -226,6 +231,80 @@ typedef struct {
     double window_best_scores[8];
     double coarse_ms, coarse_resize_ms, windows_ms, finish_ms;
 } vf_shape_match_trace;
+
+/* 模型体检结论分级（vf_shape_model_health 输出 verdict），取更重原则：
+ * - WEAK=2：实测自匹配分 <70，或任一层特征数触训练下限（≤4）；
+ * - DEGRADED=1：未达 WEAK，且实测自匹配分 <90，或任一层特征数 <8；
+ * - HEALTHY=0：其余。
+ * 单级旧格式资产无容器模板图（self_score_valid=0），自匹配项不参与分级，
+ * 仅按特征数判定。 */
+typedef enum {
+    VF_SHAPE_HEALTH_HEALTHY = 0,
+    VF_SHAPE_HEALTH_DEGRADED = 1,
+    VF_SHAPE_HEALTH_WEAK = 2
+} vf_shape_health_verdict;
+
+/* 零输入体检报告（vf_shape_model_health 输出）。struct_size 须先置为
+ * sizeof 并由库回显。verdict 分级合同见 vf_shape_health_verdict。
+ * pose_count：姿态模板总数（两级容器为各 fine 组之和，含组间 8° 重叠
+ *   复用姿态；单级为全模型姿态数）。
+ * fine_min/fine_max_features：fine 侧（单级即该模型）各金字塔层特征数
+ *   的最小/最大；coarse_features：粗层各层特征数最小值，单级恒 0。
+ * detector_features/weak/strong：生效 detector 三参快照。
+ * self_score：容器内模板灰图渲染 BGR 后对模型自身匹配一次（阈值 70，
+ *   只取最高分）的最高分；无候选=0（等价低于 70）。self_score_valid=0
+ *   表示未实测（单级资产）。
+ * template_width/height：两级=容器模板灰图尺寸；单级=首姿态最细层模板
+ *   尺寸。 */
+typedef struct {
+    uint32_t struct_size;
+    int32_t verdict;
+    uint32_t pose_count;
+    uint32_t fine_min_features, fine_max_features, coarse_features;
+    int32_t detector_features;
+    double detector_weak, detector_strong;
+    double self_score;
+    uint32_t self_score_valid;
+    uint32_t template_width, template_height;
+} vf_shape_health_report;
+
+/* 区分度审计结论（vf_shape_audit_discriminability 输出 flag）。
+ * RECOMMENDED=0：推荐区间有效；INSEPARABLE=1：lo>hi，正负分数重叠，
+ *   区间字段仅为计算中间值（lo>hi），不得消费；NO_NEGATIVE=2：负组未
+ *   提供，只报正组分布，区间字段为 0。 */
+typedef enum {
+    VF_SHAPE_AUDIT_RECOMMENDED = 0,
+    VF_SHAPE_AUDIT_INSEPARABLE = 1,
+    VF_SHAPE_AUDIT_NO_NEGATIVE = 2
+} vf_shape_audit_flag;
+
+/* 推荐区间置信度：HIGH=0（两组有效分数样本均 ≥5）；LOW=1（任一组样本
+ * <5，含零命中导致的样本不足）。 */
+typedef enum {
+    VF_SHAPE_AUDIT_CONFIDENCE_HIGH = 0,
+    VF_SHAPE_AUDIT_CONFIDENCE_LOW = 1
+} vf_shape_audit_confidence;
+
+/* 区分度审计报告（vf_shape_audit_discriminability 输出）。struct_size
+ * 须先置为 sizeof 并由库回显。
+ * 逐帧取现有匹配路径输出的最高分构成组内分布（count=有分数帧数，
+ * zero_hits=零命中帧数，零命中帧不进分布；两级匹配内部粗/精门槛以下
+ * 的帧计为零命中，属诚实口径而非缺陷）；min/p25/median/p75/max 为
+ * 线性插值分位（q·(n−1) 插值）。
+ * separation=pos_p25−neg_max（可负）。推荐区间（建议性，advisory，非
+ * 合同承诺）：lo=max(30, neg_max+5)、hi=min(85, pos_p25−5)；lo>hi 时
+ * flag=INSEPARABLE，只消费各自分布。负组可选（neg_count=0 时只报正组
+ * 分布，flag=NO_NEGATIVE，不推荐区间）。 */
+typedef struct {
+    uint32_t struct_size;
+    int32_t flag;
+    int32_t confidence;
+    uint32_t pos_count, pos_zero_hits;
+    double pos_min, pos_p25, pos_median, pos_p75, pos_max;
+    uint32_t neg_count, neg_zero_hits;
+    double neg_min, neg_p25, neg_median, neg_p75, neg_max;
+    double separation, recommend_lo, recommend_hi;
+} vf_shape_audit_report;
 
 /* 返回 ABI 版本（当前为 3）。版本协商入口，无失败路径。 */
 VF_SHAPE_API uint32_t vf_shape_abi_version(void);
@@ -334,6 +413,28 @@ VF_SHAPE_API int32_t vf_shape_polygon_metadata(uint64_t handle,
  * 回显。返回码分层同文件头。 */
 VF_SHAPE_API int32_t vf_shape_last_match_info(uint64_t handle,
     vf_shape_match_trace* out, char* error, uint32_t error_capacity);
+
+/* 模型健康体检（零输入）：从容器模板图与模型内部量导出结构与质量指标，
+ * 不消费图像输入。报告字段与分级合同见 vf_shape_health_report；
+ * out->struct_size 须先置为 sizeof。体检含一次自匹配（容器模板图对模型
+ * 自身，阈值 70 取最高分），单级资产无模板图时该项未实测（valid=0）。
+ * 返回码分层同文件头。 */
+VF_SHAPE_API int32_t vf_shape_model_health(uint64_t handle,
+    vf_shape_health_report* out, char* error, uint32_t error_capacity);
+
+/* 区分度审计与阈值推荐（⑤-5/⑤-7 合一）：两组图像（正=含目标、负=无
+ * 目标背景）各以指针数组+共享尺寸三元组传入（格式同文件头 BGR8 连续，
+ * 组内宽高/步长一致），逐帧取现有匹配路径最高分构成分布并给出建议性
+ * 阈值区间。pos_images/pos_count 须至少 1 帧；neg 可选（neg_count=0 时
+ * neg_images 可为 NULL）。out->struct_size 须先置为 sizeof。区间为统计
+ * 建议（advisory），消费方结合场景调整，不构成合同承诺。返回码分层同
+ * 文件头。 */
+VF_SHAPE_API int32_t vf_shape_audit_discriminability(uint64_t handle,
+    const uint8_t* const* pos_images, int32_t pos_width, int32_t pos_height,
+    uint64_t pos_stride, uint32_t pos_count,
+    const uint8_t* const* neg_images, int32_t neg_width, int32_t neg_height,
+    uint64_t neg_stride, uint32_t neg_count,
+    vf_shape_audit_report* out, char* error, uint32_t error_capacity);
 
 #ifdef __cplusplus
 }

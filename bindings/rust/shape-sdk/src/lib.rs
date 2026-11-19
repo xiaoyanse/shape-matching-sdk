@@ -8,8 +8,9 @@
 //! 模块划分：`error`（错误语义+错误码人话）｜`ffi`（全部 unsafe：裸声明与指针
 //! 调用）｜`library`（装载/校验/协商/全局缓存）｜`model`（安全层：训练/加载/
 //! 匹配/批量）｜`polygon`（多边形训练/轮廓建议/多边形元数据）｜`diagnostics`
-//! （预算查询/最近错误/最近匹配诊断）。
+//! （预算查询/最近错误/最近匹配诊断）｜`audit`（健康体检/区分度审计）。
 
+mod audit;
 mod diagnostics;
 mod error;
 mod ffi;
@@ -17,6 +18,7 @@ mod library;
 mod model;
 mod polygon;
 
+pub use audit::{audit_confidence, audit_flag, health_verdict, AuditReport, HealthReport};
 pub use diagnostics::{BudgetReport, LastErrorInfo, MatchTrace};
 pub use error::{error_code, error_message, ShapeError};
 pub use library::ShapeLibrary;

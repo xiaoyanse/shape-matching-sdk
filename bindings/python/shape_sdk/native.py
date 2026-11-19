@@ -18,6 +18,7 @@ from .native_library import (
     PolygonTrainParams,
     TrainConfig,
     Vertex,
+    image_args as _image_args,
     invoke,
     load_library,
 )
@@ -44,25 +45,6 @@ class NativeCandidate:
     bbox: tuple[float, float, float, float]
     transform: tuple[float, ...]
     pose_ambiguous: bool
-
-
-def _image_args(image: np.ndarray) -> tuple:
-    if (
-        not isinstance(image, np.ndarray)
-        or image.dtype != np.uint8
-        or image.ndim != 3
-        or image.shape[2] != 3
-        or not image.flags.c_contiguous
-        or any(edge < 24 or edge > 4096 for edge in image.shape[:2])
-    ):
-        raise NativeShapeError("图像须为连续 uint8 BGR，宽高范围 24–4096")
-    return (
-        image.ctypes.data,
-        image.nbytes,
-        image.shape[1],
-        image.shape[0],
-        image.strides[0],
-    )
 
 
 def _close_unchecked(library: ct.CDLL, handle: int) -> None:

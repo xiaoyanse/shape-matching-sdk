@@ -10,6 +10,7 @@ use libloading::os::windows::Library;
 #[cfg(not(windows))]
 use libloading::Library;
 
+use crate::audit::{AuditDiscriminabilityFn, ModelHealthFn};
 use crate::diagnostics::{EstimateTrainingFn, LastErrorInfoFn, LastMatchInfoFn};
 use crate::error::ShapeError;
 use crate::polygon::{PolygonMetadataFn, SuggestContoursFn, TrainPolygonFn};
@@ -168,6 +169,9 @@ pub(crate) struct NativeAbi {
     pub(crate) train_polygon_fn: Option<TrainPolygonFn>,
     pub(crate) suggest_contours_fn: Option<SuggestContoursFn>,
     pub(crate) polygon_metadata_fn: Option<PolygonMetadataFn>,
+    // 体检/审计两导出同为加性（批2b）：缺失容忍，体检/审计 API 调用处报错
+    pub(crate) model_health_fn: Option<ModelHealthFn>,
+    pub(crate) audit_fn: Option<AuditDiscriminabilityFn>,
 }
 
 /// 装载动态库。Windows 侧显式搜索 DLL 自身目录（同目录 opencv 依赖）与
@@ -244,6 +248,11 @@ impl NativeAbi {
                     .map(|s| *s),
                 polygon_metadata_fn: library
                     .get(b"vf_shape_polygon_metadata\0")
+                    .ok()
+                    .map(|s| *s),
+                model_health_fn: library.get(b"vf_shape_model_health\0").ok().map(|s| *s),
+                audit_fn: library
+                    .get(b"vf_shape_audit_discriminability\0")
                     .ok()
                     .map(|s| *s),
                 library,

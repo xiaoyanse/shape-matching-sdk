@@ -133,8 +133,10 @@ std::shared_ptr<TwoStageModel> train_two_stage(
                                         std::max(0.05, config.scale_step / 2))) + 1));
     bool coarse_ok = false;
     std::string coarse_failure;
+    int coarse_tried = 0;
     for (int k : {8, 4, 2}) {
         if (k > k0) continue;
+        ++coarse_tried;
         cv::Mat small;
         resize_coarse_image(image_bgr, small, k);
         vf_shape_train_config cc = config;
@@ -179,8 +181,8 @@ std::shared_ptr<TwoStageModel> train_two_stage(
         }
     }
     if (!coarse_ok)
-        throw std::runtime_error("coarse model training failed at all K levels (" +
-                                 coarse_failure + ")");
+        fail(VF_SHAPE_COARSE_TRAIN_FAILED, {double(coarse_tried)},
+             ("coarse model training failed at all K levels (" + coarse_failure + ")").c_str());
 
     // 模板灰度 + B7 点
     cv::Mat roi_bgr = image_bgr(roi);

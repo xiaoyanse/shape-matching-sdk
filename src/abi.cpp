@@ -1,6 +1,7 @@
 #include "model.hpp"
 #include "polygon.hpp"
 #include "two_stage.hpp"
+#include "audit.hpp"
 #include "matching_profile.hpp"
 #include <algorithm>
 #include <cstring>
@@ -388,5 +389,34 @@ int32_t vf_shape_last_match_info(uint64_t handle, vf_shape_match_trace* out,
         auto model = get(handle);
         std::lock_guard<std::mutex> lock(model->mutex);
         *out = model->last_trace;
+    });
+}
+int32_t vf_shape_model_health(uint64_t handle, vf_shape_health_report* out,
+    char* error, uint32_t capacity) {
+    return boundary(error, capacity, [&] {
+        vfshape::require(out, "missing health report output");
+        vfshape::require(out->struct_size == sizeof(*out), "invalid health report output ABI");
+        auto model = get(handle);
+        std::lock_guard<std::mutex> lock(model->mutex);
+        *out = vfshape::model_health(model->single.get(), model->two_stage.get());
+    });
+}
+int32_t vf_shape_audit_discriminability(uint64_t handle,
+    const uint8_t* const* pos_images, int32_t pos_width, int32_t pos_height,
+    uint64_t pos_stride, uint32_t pos_count,
+    const uint8_t* const* neg_images, int32_t neg_width, int32_t neg_height,
+    uint64_t neg_stride, uint32_t neg_count,
+    vf_shape_audit_report* out, char* error, uint32_t error_capacity) {
+    return boundary(error, error_capacity, [&] {
+        vfshape::require(out && pos_images && pos_count >= 1,
+                         "missing audit report output or positive images");
+        vfshape::require(neg_count == 0 || neg_images, "missing negative image array");
+        vfshape::require(out->struct_size == sizeof(*out), "invalid audit report output ABI");
+        auto model = get(handle);
+        std::lock_guard<std::mutex> lock(model->mutex);
+        *out = vfshape::audit_discriminability(
+            model->single.get(), model->two_stage.get(),
+            pos_images, pos_width, pos_height, pos_stride, pos_count,
+            neg_images, neg_width, neg_height, neg_stride, neg_count);
     });
 }

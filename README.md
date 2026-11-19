@@ -109,6 +109,41 @@ Rust 绑定同构：`train_polygon_model` / `suggest_contours` / `Model::polygon
 - **耗时承诺**：1080P 参考图 + 35 位姿、外接矩形 ≤400px 的多边形训练 ≤2s
   （实测基线见 tests/polygon_test.cpp 耗时背书用例）
 
+## 模板健康体检与区分度审计（ABI v3 加性导出）
+
+零输入体检（模型结构与质量分级）与建议性阈值推荐（advisory），训练/匹配主链
+零行为变化。
+
+```python
+from shape_sdk import NativeModel, model_health, audit_discriminability
+
+model = NativeModel(data)
+model_health(model)   # {"verdict": 0, "verdict_text": "健康…", "self_score": 9x.x,
+                      #  "pose_count": …, "template_width/height": …, "detector_…": …}
+audit_discriminability(model, pos_frames, neg_frames)
+# {"flag": 0, "confidence": 1, "pos_p25": …, "neg_max": …, "separation": …,
+#  "recommend_lo": 30.0, "recommend_hi": 85.0, …}   # 区间为建议性（advisory）
+```
+
+Rust 绑定同构：`Model::health()` / `Model::audit_discriminability(&pos, &neg)`
+（`HealthReport` / `AuditReport` + `health_verdict` / `audit_flag` /
+`audit_confidence` 常量组）。
+
+- **体检分级（取更重）**：WEAK=实测自匹配 <70 或任一层特征数触训练下限（≤4）；
+  DEGRADED=未达 WEAK 且自匹配 <90 或任一层特征数 <8；其余 HEALTHY。自匹配=
+  容器内模板灰图渲染 BGR 对模型自身匹配一次（阈值 70 只取最高分）；单级旧资产
+  无容器模板图（self_score_valid=0），自匹配项不参与分级，仅按特征数判定
+- **审计口径**：逐帧取现有匹配路径最高分构成组内分布（两级路径内部粗/精门槛
+  以下的帧计零命中、不进分布，属诚实口径）；负组可选（缺省只报正组分布，
+  flag=NO_NEGATIVE，不推荐区间）；正组须至少 1 帧
+- **推荐区间（建议性，advisory，非合同承诺）**：lo=max(30, neg_max+5)、
+  hi=min(85, pos_p25−5)；lo>hi 时 flag=INSEPARABLE（正负分数重叠，区间字段
+  仅为计算中间值，不得消费）；任一组有效分数样本 <5 时 confidence=LOW；
+  消费方结合场景调整，不构成精度承诺
+- **错误码**：参考 ROI 内边缘特征不足返回 `VF_SHAPE_INSUFFICIENT_FEATURES(18)`
+  （params：特征数下限 4）；两级容器粗层全部 K 档失败返回
+  `VF_SHAPE_COARSE_TRAIN_FAILED(19)`（params：尝试的 K 档数）
+
 ## ABI 兼容合同（消费方对接必读）
 
 - C ABI 出口固定宽度结构体，版本号 `vf_shape_abi_version()`，当前 **3**

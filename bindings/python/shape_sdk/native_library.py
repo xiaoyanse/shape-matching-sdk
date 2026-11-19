@@ -10,9 +10,31 @@ import sys
 import threading
 from pathlib import Path
 
+import numpy as np
+
 
 class NativeShapeError(RuntimeError):
     pass
+
+
+def image_args(image: np.ndarray) -> tuple:
+    """BGR 输入统一校验：返回 (数据指针, 字节数, 宽, 高, 步长)。"""
+    if (
+        not isinstance(image, np.ndarray)
+        or image.dtype != np.uint8
+        or image.ndim != 3
+        or image.shape[2] != 3
+        or not image.flags.c_contiguous
+        or any(edge < 24 or edge > 4096 for edge in image.shape[:2])
+    ):
+        raise NativeShapeError("图像须为连续 uint8 BGR，宽高范围 24–4096")
+    return (
+        image.ctypes.data,
+        image.nbytes,
+        image.shape[1],
+        image.shape[0],
+        image.strides[0],
+    )
 
 
 class TrainConfig(ct.Structure):
@@ -121,6 +143,49 @@ class PolygonTrainParams(ct.Structure):
         ("weak_th", ct.c_double),
         ("strong_th", ct.c_double),
         ("feature_count", ct.c_int32),
+    ]
+
+
+class HealthReport(ct.Structure):
+    _fields_ = [
+        ("struct_size", ct.c_uint32),
+        ("verdict", ct.c_int32),
+        ("pose_count", ct.c_uint32),
+        ("fine_min_features", ct.c_uint32),
+        ("fine_max_features", ct.c_uint32),
+        ("coarse_features", ct.c_uint32),
+        ("detector_features", ct.c_int32),
+        ("detector_weak", ct.c_double),
+        ("detector_strong", ct.c_double),
+        ("self_score", ct.c_double),
+        ("self_score_valid", ct.c_uint32),
+        ("template_width", ct.c_uint32),
+        ("template_height", ct.c_uint32),
+    ]
+
+
+class AuditReport(ct.Structure):
+    _fields_ = [
+        ("struct_size", ct.c_uint32),
+        ("flag", ct.c_int32),
+        ("confidence", ct.c_int32),
+        ("pos_count", ct.c_uint32),
+        ("pos_zero_hits", ct.c_uint32),
+        ("pos_min", ct.c_double),
+        ("pos_p25", ct.c_double),
+        ("pos_median", ct.c_double),
+        ("pos_p75", ct.c_double),
+        ("pos_max", ct.c_double),
+        ("neg_count", ct.c_uint32),
+        ("neg_zero_hits", ct.c_uint32),
+        ("neg_min", ct.c_double),
+        ("neg_p25", ct.c_double),
+        ("neg_median", ct.c_double),
+        ("neg_p75", ct.c_double),
+        ("neg_max", ct.c_double),
+        ("separation", ct.c_double),
+        ("recommend_lo", ct.c_double),
+        ("recommend_hi", ct.c_double),
     ]
 
 
@@ -272,6 +337,37 @@ def load_library() -> ct.CDLL:
             if function is None:
                 continue
             function.argtypes = polygon_signatures[name]
+            function.restype = ct.c_int32
+        # 体检/审计两导出同为加性：旧运行时缺失不阻断装载，调用处报错
+        audit_signatures = {
+            "model_health": [ct.c_uint64, ct.POINTER(HealthReport)] + error,
+            "audit_discriminability": [
+                ct.c_uint64,
+                ct.POINTER(ct.c_void_p),
+                ct.c_int32,
+                ct.c_int32,
+                ct.c_uint64,
+                ct.c_uint32,
+                ct.POINTER(ct.c_void_p),
+                ct.c_int32,
+                ct.c_int32,
+                ct.c_uint64,
+                ct.c_uint32,
+                ct.POINTER(AuditReport),
+            ]
+            + error,
+        }
+        audit = {}
+        for name, signature in audit_signatures.items():
+            try:
+                audit[name] = getattr(library, f"vf_shape_{name}")
+            except AttributeError:
+                audit[name] = None
+        library._audit_exports = all(value is not None for value in audit.values())
+        for name, function in audit.items():
+            if function is None:
+                continue
+            function.argtypes = audit_signatures[name]
             function.restype = ct.c_int32
         _library = library
         return library

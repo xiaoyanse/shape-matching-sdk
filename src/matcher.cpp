@@ -231,7 +231,8 @@ std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& 
             model->poses.push_back(pose);
         }
     }
-    require(!model->poses.empty(), "insufficient edge features in reference ROI");
+    require_coded(!model->poses.empty(), VF_SHAPE_INSUFFICIENT_FEATURES,
+                  "insufficient edge features in reference ROI", 4.0);
     // 角度插值负结果（口径不对齐）暂不消费——不填 adjacency，vendor
     // 邻居响应计算随之跳过（Codex 性能项：未消费计算白费）。机制保留，
     // 口径对齐实验时重新启用此处。
