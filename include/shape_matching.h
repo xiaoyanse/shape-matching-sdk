@@ -119,6 +119,41 @@ typedef struct {
     char error[256];
 } vf_shape_batch_item;
 
+/* 多边形顶点与轮廓：坐标为参考图（原图）坐标系，单位像素，原点左上。
+ * 顶点数组由调用方分配，库只在调用期间借用。 */
+typedef struct {
+    double x, y;
+} vf_shape_vertex;
+
+typedef struct {
+    const vf_shape_vertex* vertices;
+    uint32_t count;
+} vf_shape_polygon;
+
+/* 多边形训练参数（独立结构，vf_shape_train_config 不动）。
+ * struct_size 必须先置为 sizeof(vf_shape_polygon_train_params)。
+ * outline：外环 3..64 顶点，任意绕向（SDK 归一为固定绕向后持久化与回读）；
+ *   顶点须落在参考图坐标域 [0,width]×[0,height] 内，轮廓不得自交或退化
+ *   （有向面积非零）。
+ * holes/hole_count：洞 0..8 个，每洞 3..64 顶点、面积 ≥64px²、须完全在外环
+ *   内（含顶点不得触及外环边界）；洞语义=训练特征提取期掩蔽（洞内像素不产
+ *   特征），洞间重叠不校验（按并集掩蔽）。
+ * 外环外接矩形须满足训练 ROI 同款 24..4096 像素合同，并作为姿态/画布/像素
+ *   预算的记账基（与矩形训练同式同序）；短边 <48px 时两级粗层无法满足最小
+ *   ROI 合同，训练将以错误拒绝（与矩形训练同一行为）。
+ * angle/scale/weak_th/strong_th/feature_count：与 vf_shape_train_config 同名
+ *   字段语义一致（0=默认）。 */
+typedef struct {
+    uint32_t struct_size;
+    vf_shape_polygon outline;
+    const vf_shape_polygon* holes;
+    uint32_t hole_count;
+    double angle_min, angle_max, angle_step;
+    double scale_min, scale_max, scale_step;
+    double weak_th, strong_th;
+    int32_t feature_count;
+} vf_shape_polygon_train_params;
+
 /* 稳定错误码：与错误文本并存，供程序化分类与人话映射。语义为"哪类约束
  * 被违反"，命名与既有错误文本关键词一一挂钩；未覆盖的失败按 INTERNAL。
  * 码值经由 vf_shape_last_error_info 查询（线程局部，见该入口注释）。 */
@@ -140,6 +175,19 @@ typedef enum {
     VF_SHAPE_MODEL_SIZE = 14,
     VF_SHAPE_MODEL_TAMPER = 15,
     VF_SHAPE_SEARCH_BUDGET = 16,
+    /* 多边形训练参数几何非法（vf_shape_train_polygon 与容器 poly 段加载校验
+     * 共用）。params 依次为：失败细分类型、主参数、次参数。细分类型：
+     * 1=外环顶点数越界 3..64（主=实际数，次=上限）；
+     * 2=顶点坐标非有限或越参考图坐标域（主=顶点全局下标，外环在前、
+     *   各洞顶点依序接续，从 0 起）；
+     * 3=外环退化（有向面积近零，主=面积绝对值）；
+     * 4=外环自交或重入（主/次=相交边下标，闭边计最后一条）；
+     * 5=洞数越界 ≤8（主=实际数）；
+     * 6=洞几何非法（主=洞下标，次=细分类型，复用 1/2/3/4 语义）；
+     * 7=洞面积不足 64px²（主=洞下标，次=实际面积）；
+     * 8=洞未完全在外环内（主=洞下标）；
+     * 9=外接矩形违反 24..4096 合同（主=宽，次=高）。 */
+    VF_SHAPE_INVALID_POLYGON = 17,
     VF_SHAPE_INTERNAL = 99
 } vf_shape_error_code;
 
@@ -244,6 +292,42 @@ VF_SHAPE_API void vf_shape_last_error_info(int32_t* code, double params[6],
 VF_SHAPE_API int32_t vf_shape_estimate_training(const vf_shape_train_config* config,
     int32_t image_w, int32_t image_h, vf_shape_budget_report* out,
     char* error, uint32_t error_capacity);
+
+/* 多边形模板训练：与 vf_shape_train 同链路（两级容器模型），仅把训练掩码从
+ * 矩形 ROI 换为多边形（外环填充、洞掩蔽），位姿映射/预算/导出/加载/匹配
+ * 全部复用矩形路径（外接矩形即 ROI）。成功后 *handle 为新句柄；导出为容器
+ * 格式，meta 段携带可选 poly 键（归一化外环顶点+洞分段+外接矩形）；旧版本
+ * 库加载该容器时忽略 poly 键、按外接矩形回退解读（兼容承诺）。图像合同见
+ * 文件头注释。 */
+VF_SHAPE_API int32_t vf_shape_train_polygon(const uint8_t* image, uint64_t image_size,
+    int32_t width, int32_t height, uint64_t stride,
+    const vf_shape_polygon_train_params* params, uint64_t* handle,
+    char* error, uint32_t error_capacity);
+
+/* 自动轮廓提取建议：Canny→外轮廓→多边形逼近，按面积降序输出前
+ * max_suggestions 条建议（固定阈值，无随机：同图两次调用输出逐字节一致）。
+ * roi_hint 非空时仅在 xywh 先验框内搜索（须完整落在图像内），顶点坐标仍为
+ * 原图坐标系；NULL=全图。max_vertices_per 限每条建议顶点数（3..64），无法
+ * 化简到限内的轮廓不输出；面积 <64px² 的碎轮廓不输出。out_vertices 容量须
+ * 为 max_suggestions×max_vertices_per 个顶点，out_vertex_counts 容量须为
+ * max_suggestions，第 i 条建议占 out_vertices 前缀累计偏移。
+ * 本入口返回值语义特殊：≥0 为成功（值=建议条数，0=无建议，非错误），
+ * -1=可报告失败，-2=未分类原生失败；失败时错误文本照常写入 error。 */
+VF_SHAPE_API int32_t vf_shape_suggest_contours(const uint8_t* image, uint64_t image_size,
+    int32_t width, int32_t height, uint64_t stride,
+    const int32_t roi_hint[4],
+    uint32_t max_suggestions, uint32_t max_vertices_per,
+    vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts,
+    char* error, uint32_t error_capacity);
+
+/* 多边形元数据回读：多边形资产返回持久化的归一化外环顶点（与训练输入经
+ * 绕向归一后逐字段一致）与洞数；矩形资产（含旧格式与单级资产）回退为训练
+ * ROI 四角（左上、右上、右下、左下）且洞数为 0。两次调用模式同
+ * vf_shape_export：先以 outline=NULL 且 capacity=0 查询 *outline_count，再以
+ * 不小于该值的缓冲取回；缓冲不足返回 1 且不写顶点内容。 */
+VF_SHAPE_API int32_t vf_shape_polygon_metadata(uint64_t handle,
+    vf_shape_vertex* outline, uint32_t capacity, uint32_t* outline_count,
+    uint32_t* hole_count, char* error, uint32_t error_capacity);
 
 /* 查询句柄最近一次 match/match_batch 的诊断快照。非阻塞快照：句柄锁下
  * 读取，与在途匹配串行。out->struct_size 须先置为 sizeof，返回后库按其

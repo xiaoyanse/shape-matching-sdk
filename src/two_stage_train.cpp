@@ -3,6 +3,7 @@
 
 #include "two_stage.hpp"
 #include "coarse_image.hpp"
+#include "polygon.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -68,10 +69,13 @@ void measure_bias(Model& model, const cv::Mat& image_bgr,
 
 // —— 两级训练（Python train_packaged 对齐）——
 std::shared_ptr<TwoStageModel> train_two_stage(
-    const cv::Mat& image_bgr, const vf_shape_train_config& config) {
+    const cv::Mat& image_bgr, const vf_shape_train_config& config,
+    const PolygonShape* polygon) {
     const int w = image_bgr.cols, h = image_bgr.rows;
     validate_config(config, w, h);
-    const cv::Rect roi(config.roi_x, config.roi_y, config.roi_width, config.roi_height);
+    const cv::Rect roi = polygon ? polygon->bounds
+                                 : cv::Rect(config.roi_x, config.roi_y,
+                                            config.roi_width, config.roi_height);
 
     // 角度分组：group_span=16°（8° 步长+8° 余量），重叠 8°
     const double fine_step = std::min(config.angle_step, 0.5);
@@ -102,7 +106,8 @@ std::shared_ptr<TwoStageModel> train_two_stage(
         fc.scale_max = 1.0;
         fc.scale_step = 1.0;
         // 相邻组来自同一张参考图，重叠角度复用完全相同的特征。
-        return train(image_bgr, fc, model->fines.empty() ? nullptr : model->fines.back().get());
+        return train(image_bgr, fc, model->fines.empty() ? nullptr : model->fines.back().get(),
+                     polygon);
     };
 
     if (n_groups <= 1) {
@@ -133,12 +138,25 @@ std::shared_ptr<TwoStageModel> train_two_stage(
         cv::Mat small;
         resize_coarse_image(image_bgr, small, k);
         vf_shape_train_config cc = config;
-        // 缩图尺寸同为 floor 整除（coarse_image.cpp），ROI 同口径映射：
-        // 原点允许 0（整图 ROI），宽高对实际缩图裁限
-        cc.roi_x = config.roi_x / k;
-        cc.roi_y = config.roi_y / k;
-        cc.roi_width = std::min(config.roi_width / k, small.cols - cc.roi_x);
-        cc.roi_height = std::min(config.roi_height / k, small.rows - cc.roi_y);
+        PolygonShape coarse_polygon;
+        const PolygonShape* coarse_shape = nullptr;
+        if (polygon) {
+            // 多边形粗层：顶点除 k 缩放，ROI=缩放后整包界并截到缩图内
+            //（fillPoly 自裁剪越界部分；相似缩放保持已校验的几何关系）
+            coarse_polygon = scale_polygon(*polygon, 1.0 / k, small.cols, small.rows);
+            coarse_shape = &coarse_polygon;
+            cc.roi_x = coarse_polygon.bounds.x;
+            cc.roi_y = coarse_polygon.bounds.y;
+            cc.roi_width = coarse_polygon.bounds.width;
+            cc.roi_height = coarse_polygon.bounds.height;
+        } else {
+            // 缩图尺寸同为 floor 整除（coarse_image.cpp），ROI 同口径映射：
+            // 原点允许 0（整图 ROI），宽高对实际缩图裁限
+            cc.roi_x = config.roi_x / k;
+            cc.roi_y = config.roi_y / k;
+            cc.roi_width = std::min(config.roi_width / k, small.cols - cc.roi_x);
+            cc.roi_height = std::min(config.roi_height / k, small.rows - cc.roi_y);
+        }
         cc.angle_step = kCoarseAngleStep;
         cc.scale_step = std::max(0.05, (config.scale_max - config.scale_min) /
                                             std::max(1, coarse_steps - 1));
@@ -149,7 +167,7 @@ std::shared_ptr<TwoStageModel> train_two_stage(
             continue;
         }
         try {
-            model->coarse = train(small, cc);
+            model->coarse = train(small, cc, nullptr, coarse_shape);
             model->k = k;
             coarse_ok = true;
             break;
@@ -174,6 +192,12 @@ std::shared_ptr<TwoStageModel> train_two_stage(
         const double mid = (model->groups[i].lo + model->groups[i].hi) / 2.0;
         measure_bias(*model->fines[i], image_bgr, roi, mid,
                      &model->groups[i].bias_x, &model->groups[i].bias_y);
+    }
+    if (polygon) {
+        auto asset = std::make_shared<PolygonAsset>();
+        asset->outline = flatten_vertices(polygon->outline);
+        for (const auto& hole : polygon->holes) asset->holes.push_back(flatten_vertices(hole));
+        model->polygon = std::move(asset);
     }
     return model;
 }

@@ -12,7 +12,13 @@ from .diagnostics import (
     last_error_info,
     last_match_info,
 )
-from .native import NativeCandidate, NativeModel, train_model
+from .native import (
+    NativeCandidate,
+    NativeModel,
+    suggest_contours,
+    train_model,
+    train_polygon_model,
+)
 from .native_batch import match_batch
 from .native_library import (
     BatchItem,
@@ -20,7 +26,10 @@ from .native_library import (
     Candidate,
     MatchTrace,
     NativeShapeError,
+    Polygon,
+    PolygonTrainParams,
     TrainConfig,
+    Vertex,
     invoke,
     load_library,
     runtime_directory,
@@ -35,7 +44,10 @@ __all__ = [
     "NativeCandidate",
     "NativeModel",
     "NativeShapeError",
+    "Polygon",
+    "PolygonTrainParams",
     "TrainConfig",
+    "Vertex",
     "error_message",
     "estimate_training",
     "invoke",
@@ -44,5 +56,7 @@ __all__ = [
     "load_library",
     "match_batch",
     "runtime_directory",
+    "suggest_contours",
     "train_model",
+    "train_polygon_model",
 ]

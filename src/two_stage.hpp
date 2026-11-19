@@ -28,6 +28,12 @@ struct B7Model {
 };
 B7Model extract_b7_points(const cv::Mat& template_gray);
 
+// 容器 poly 段资产（多边形训练持久化形态）：顶点已绕向归一，坐标=参考图系
+struct PolygonAsset {
+    std::vector<double> outline;             // x0,y0,x1,y1,...
+    std::vector<std::vector<double>> holes;  // 每洞 x0,y0,...
+};
+
 struct TwoStageModel {
     std::vector<std::shared_ptr<Model>> fines;   // 角度分组精修模型
     std::shared_ptr<Model> coarse;               // 粗层模型
@@ -37,15 +43,18 @@ struct TwoStageModel {
     B7Model b7;                                  // B7 轮廓点（惰性或训练期提取）
     vf_shape_train_config base_config{};         // 原始训练配置（供 B7 角度步长等）
     int ref_width = 0, ref_height = 0;           // 原始参考图尺寸；0=旧容器（元数据回退模板灰图尺寸）
+    std::shared_ptr<PolygonAsset> polygon;       // 多边形资产；空=矩形资产
 };
 
 // 容器编解码（VF2S3 字节级兼容；返回 nullptr 表示非容器格式）
 std::shared_ptr<TwoStageModel> decode_two_stage(const uint8_t* bytes, uint64_t size);
 std::vector<uint8_t> encode_two_stage(const TwoStageModel& model);
 
-// 两级打包训练（等价 Python train_packaged）：fines 分组 + coarse + 偏置 + 容器
+// 两级打包训练（等价 Python train_packaged）：fines 分组 + coarse + 偏置 + 容器；
+// polygon 非空时训练掩码为多边形（config ROI 须等于其外接矩形）
 std::shared_ptr<TwoStageModel> train_two_stage(
-    const cv::Mat& image_bgr, const vf_shape_train_config& config);
+    const cv::Mat& image_bgr, const vf_shape_train_config& config,
+    const struct PolygonShape* polygon = nullptr);
 
 // 两级匹配（等价 Python TwoStageMatcher.match，含 B7 top1 精修）；
 // trace 非空时回填最近一次匹配的诊断快照（计数常开，毫秒仅计时构建非 0）

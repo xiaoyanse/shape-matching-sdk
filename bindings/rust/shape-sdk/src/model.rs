@@ -70,7 +70,7 @@ pub struct Candidate {
 }
 
 /// 特征筛选三参；零值=原生默认（feature_count=128、weak_th=30、strong_th=60）
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectorParams {
     pub feature_count: i32,
     pub weak_th: f64,

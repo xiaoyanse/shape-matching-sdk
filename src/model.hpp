@@ -88,7 +88,8 @@ DetectorTuning validate_detector_params(int features, double weak, double strong
 // 持久化三参严格校验（零=损坏拒绝，防 float 下溢洗白链）——容器/codec 加载端用
 DetectorTuning validate_persisted_detector_params(int features, double weak, double strong);
 std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& config,
-                             const Model* previous_group = nullptr);
+                             const Model* previous_group = nullptr,
+                             const struct PolygonShape* polygon = nullptr);
 std::vector<uint8_t> encode(const Model& model);
 std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size);
 std::vector<vf_shape_candidate> match(Model& model, const cv::Mat& image, double threshold);

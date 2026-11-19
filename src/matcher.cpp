@@ -1,4 +1,5 @@
 #include "model.hpp"
+#include "polygon.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -163,7 +164,7 @@ void validate_config(const vf_shape_train_config& c, int width, int height) {
 }
 
 std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& c,
-                             const Model* previous_group) {
+                             const Model* previous_group, const PolygonShape* polygon) {
     validate_config(c, image.cols, image.rows);
     if (previous_group) {
         const auto& p = previous_group->config;
@@ -189,7 +190,10 @@ std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& 
         const cv::Rect roi(padding, padding, scaled.cols, scaled.rows);
         scaled.copyTo(canvas(roi));
         cv::Mat mask(canvas.size(), CV_8UC1, cv::Scalar(0));
-        mask(roi).setTo(255);
+        if (polygon)
+            fill_polygon_mask(mask, *polygon, c.roi_x, c.roi_y, scale, padding);
+        else
+            mask(roi).setTo(255);
         for (double angle : angles) {
             if (previous_group) {
                 const auto& poses = previous_group->poses;

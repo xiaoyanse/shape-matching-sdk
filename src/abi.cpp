@@ -1,4 +1,5 @@
 #include "model.hpp"
+#include "polygon.hpp"
 #include "two_stage.hpp"
 #include "matching_profile.hpp"
 #include <algorithm>
@@ -304,6 +305,79 @@ int32_t vf_shape_estimate_training(const vf_shape_train_config* config, int32_t 
         vfshape::require(config && out, "missing budget report output/config");
         vfshape::require(out->struct_size == sizeof(*out), "invalid budget report output ABI");
         *out = vfshape::estimate_training(*config, image_w, image_h);
+    });
+}
+int32_t vf_shape_train_polygon(const uint8_t* image, uint64_t image_size, int32_t width,
+    int32_t height, uint64_t stride, const vf_shape_polygon_train_params* params,
+    uint64_t* handle, char* error, uint32_t capacity) {
+    return boundary(error, capacity, [&] {
+        vfshape::require(handle && params, "missing polygon training output/params");
+        *handle = 0;
+        const auto frame = vfshape::checked_image(image, image_size, width, height, stride);
+        const auto shape = vfshape::validate_polygon(*params, width, height);
+        const auto config = vfshape::config_from_polygon(*params, shape);
+        auto holder = std::make_shared<ModelHolder>();
+        holder->two_stage = vfshape::train_two_stage(frame, config, &shape);
+        put(std::move(holder), handle);
+    });
+}
+// 建议条数为返回值（0=无建议非错误），失败走负值分层：-1 可报告 / -2 未分类
+int32_t vf_shape_suggest_contours(const uint8_t* image, uint64_t image_size, int32_t width,
+    int32_t height, uint64_t stride, const int32_t* roi_hint, uint32_t max_suggestions,
+    uint32_t max_vertices_per, vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts,
+    char* error, uint32_t error_capacity) {
+    if (error && error_capacity) error[0] = '\0';
+    const uint64_t scope = vfshape::begin_error_scope();
+    try {
+        vfshape::require(out_vertices && out_vertex_counts, "missing suggestion output buffers");
+        const auto frame = vfshape::checked_image(image, image_size, width, height, stride);
+        return int32_t(vfshape::suggest_contours(frame, roi_hint, max_suggestions,
+                                                 max_vertices_per, out_vertices,
+                                                 out_vertex_counts));
+    } catch (const std::exception& ex) {
+        vfshape::finish_error_scope(scope);
+        if (error && error_capacity) copy_error(error, error_capacity, ex.what());
+        return -1;
+    } catch (...) {
+        vfshape::finish_error_scope(scope);
+        if (error && error_capacity)
+            copy_error(error, error_capacity, "unknown native matching failure");
+        return -2;
+    }
+}
+int32_t vf_shape_polygon_metadata(uint64_t handle, vf_shape_vertex* outline, uint32_t capacity,
+    uint32_t* outline_count, uint32_t* hole_count, char* error, uint32_t error_capacity) {
+    return boundary(error, error_capacity, [&] {
+        vfshape::require(outline_count && hole_count, "missing polygon metadata output");
+        auto model = get(handle);
+        std::lock_guard<std::mutex> lock(model->mutex);
+        std::vector<cv::Point2d> points;
+        uint32_t holes = 0;
+        if (model->two_stage && model->two_stage->polygon) {
+            const auto& flat = model->two_stage->polygon->outline;
+            points.reserve(flat.size() / 2);
+            for (size_t i = 0; i + 1 < flat.size(); i += 2)
+                points.push_back({flat[i], flat[i + 1]});
+            holes = uint32_t(model->two_stage->polygon->holes.size());
+        } else {
+            // 矩形资产（含旧格式与单级资产）回退 ROI 四角：左上、右上、右下、左下
+            const auto& c = model->two_stage ? model->two_stage->base_config
+                                             : model->single->config;
+            points = {{double(c.roi_x), double(c.roi_y)},
+                      {double(c.roi_x + c.roi_width), double(c.roi_y)},
+                      {double(c.roi_x + c.roi_width), double(c.roi_y + c.roi_height)},
+                      {double(c.roi_x), double(c.roi_y + c.roi_height)}};
+        }
+        *outline_count = uint32_t(points.size());
+        *hole_count = holes;
+        if (!outline && capacity == 0) return;
+        vfshape::require_coded(capacity >= points.size(), VF_SHAPE_CAPACITY_INVALID,
+                               "polygon metadata buffer too small", double(capacity),
+                               double(points.size()));
+        for (size_t i = 0; i < points.size(); ++i) {
+            outline[i].x = points[i].x;
+            outline[i].y = points[i].y;
+        }
     });
 }
 int32_t vf_shape_last_match_info(uint64_t handle, vf_shape_match_trace* out,

@@ -92,6 +92,38 @@ class MatchTrace(ct.Structure):
     ]
 
 
+class Vertex(ct.Structure):
+    _fields_ = [
+        ("x", ct.c_double),
+        ("y", ct.c_double),
+    ]
+
+
+class Polygon(ct.Structure):
+    _fields_ = [
+        ("vertices", ct.POINTER(Vertex)),
+        ("count", ct.c_uint32),
+    ]
+
+
+class PolygonTrainParams(ct.Structure):
+    _fields_ = [
+        ("struct_size", ct.c_uint32),
+        ("outline", Polygon),
+        ("holes", ct.POINTER(Polygon)),
+        ("hole_count", ct.c_uint32),
+        ("angle_min", ct.c_double),
+        ("angle_max", ct.c_double),
+        ("angle_step", ct.c_double),
+        ("scale_min", ct.c_double),
+        ("scale_max", ct.c_double),
+        ("scale_step", ct.c_double),
+        ("weak_th", ct.c_double),
+        ("strong_th", ct.c_double),
+        ("feature_count", ct.c_int32),
+    ]
+
+
 _library: ct.CDLL | None = None
 _lock = threading.Lock()
 _dll_directories: list[object] = []
@@ -209,6 +241,38 @@ def load_library() -> ct.CDLL:
             function.restype = ct.c_int32
         if optional["last_error_info"] is not None:
             optional["last_error_info"].restype = None
+        # 多边形三导出同为加性：旧运行时缺失不阻断装载，调用处报错
+        polygon_signatures = {
+            "train_polygon":
+                image + [ct.POINTER(PolygonTrainParams), ct.POINTER(ct.c_uint64)] + error,
+            "suggest_contours": image + [
+                ct.POINTER(ct.c_int32),
+                ct.c_uint32,
+                ct.c_uint32,
+                ct.POINTER(Vertex),
+                ct.POINTER(ct.c_uint32),
+            ] + error,
+            "polygon_metadata": [
+                ct.c_uint64,
+                ct.POINTER(Vertex),
+                ct.c_uint32,
+                ct.POINTER(ct.c_uint32),
+                ct.POINTER(ct.c_uint32),
+            ]
+            + error,
+        }
+        polygon = {}
+        for name, signature in polygon_signatures.items():
+            try:
+                polygon[name] = getattr(library, f"vf_shape_{name}")
+            except AttributeError:
+                polygon[name] = None
+        library._polygon_exports = all(value is not None for value in polygon.values())
+        for name, function in polygon.items():
+            if function is None:
+                continue
+            function.argtypes = polygon_signatures[name]
+            function.restype = ct.c_int32
         _library = library
         return library
 

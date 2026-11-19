@@ -7,13 +7,15 @@
 //!
 //! 模块划分：`error`（错误语义+错误码人话）｜`ffi`（全部 unsafe：裸声明与指针
 //! 调用）｜`library`（装载/校验/协商/全局缓存）｜`model`（安全层：训练/加载/
-//! 匹配/批量）｜`diagnostics`（预算查询/最近错误/最近匹配诊断）。
+//! 匹配/批量）｜`polygon`（多边形训练/轮廓建议/多边形元数据）｜`diagnostics`
+//! （预算查询/最近错误/最近匹配诊断）。
 
 mod diagnostics;
 mod error;
 mod ffi;
 mod library;
 mod model;
+mod polygon;
 
 pub use diagnostics::{BudgetReport, LastErrorInfo, MatchTrace};
 pub use error::{error_code, error_message, ShapeError};
@@ -22,3 +24,4 @@ pub use model::{
     BatchRequest, BgrImage, Candidate, DetectorParams, Model, ModelMetadata, TrainParams,
     match_batch, train_model,
 };
+pub use polygon::{PolygonMetadata, PolygonTrainParams, PolygonVertex, suggest_contours, train_polygon_model};

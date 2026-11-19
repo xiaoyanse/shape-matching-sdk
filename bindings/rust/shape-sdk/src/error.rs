@@ -78,6 +78,7 @@ pub mod error_code {
     pub const MODEL_SIZE: i32 = 14;
     pub const MODEL_TAMPER: i32 = 15;
     pub const SEARCH_BUDGET: i32 = 16;
+    pub const INVALID_POLYGON: i32 = 17;
     pub const INTERNAL: i32 = 99;
 
     /// 码名（未知码返回 UNKNOWN）
@@ -100,6 +101,7 @@ pub mod error_code {
             MODEL_SIZE => "MODEL_SIZE",
             MODEL_TAMPER => "MODEL_TAMPER",
             SEARCH_BUDGET => "SEARCH_BUDGET",
+            INVALID_POLYGON => "INVALID_POLYGON",
             INTERNAL => "INTERNAL",
             _ => "UNKNOWN",
         }
@@ -135,6 +137,7 @@ pub fn error_message(code: i32, params: &[f64]) -> String {
         error_code::MODEL_SIZE => "模型资产尺寸超预算 ≤32MiB（参数：字节数,上限）".into(),
         error_code::MODEL_TAMPER => "模型资产校验失败：内容与容器合同不符或被篡改".into(),
         error_code::SEARCH_BUDGET => "匹配搜索预算超限：姿态数×搜索块数过多（参数：用量,上限）".into(),
+        error_code::INVALID_POLYGON => "多边形训练参数非法：顶点 3–64 且在图域内、无自交；洞 ≤8、每洞面积 ≥64px² 且完全在外环内（参数：细分类型,主参数,次参数）".into(),
         error_code::INTERNAL => "未分类内部错误".into(),
         other => return format!("未知错误码 {other}"),
     };

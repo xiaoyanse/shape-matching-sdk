@@ -67,8 +67,47 @@ model.close()?;                                   // 幂等；Drop 兜底
 - 与 Python 侧的关系：同一 C ABI v3 之上的平行安全层，训练/匹配/批量/元数据
   语义与错误口径对齐 `bindings/python/shape_sdk`。测试同样对齐：`tests/smoke.rs`
   + `tests/abi_chain.rs` 对应 `scripts/test_main_chain.py` 核心组（全链/元数据
-  往返/detector 往返/批量混合/生命周期），`tests/conformance.rs` 复刻
+  往返/detector 往返/批量混合/生命周期），`tests/polygon.rs` 对应
+  `scripts/test_polygon_chain.py` 多边形组，`tests/conformance.rs` 复刻
   `benchmarks/run_facts.py` 四帧事实基准全语义（同一 spec 真值断言）
+
+## 多边形模板能力（ABI v3 加性导出）
+
+在矩形 ROI 之外支持任意多边形训练掩码（外环+洞），位姿/预算/导出/加载/匹配
+全部复用矩形路径（外环外接矩形即 ROI），矩形训练零行为变化。
+
+```python
+from shape_sdk import train_polygon_model, suggest_contours
+
+# 自动轮廓提取建议（Canny→外轮廓→多边形逼近，确定性；返回顶点集合）
+suggestions = suggest_contours(reference_bgr)          # 或 roi_hint=(x, y, w, h)
+
+# 训练：outline 3–64 顶点任意绕向（SDK 归一）；洞 ≤8、每洞面积 ≥64px²
+# 且完全在外环内；角度/缩放/阈值语义与 train_model 同名参数一致
+data = train_polygon_model(reference_bgr, outline, holes=[hole],
+                           angle_min=-30, angle_max=30, angle_step=15,
+                           scale_min=1.0, scale_max=1.0, scale_step=1.0)
+model = NativeModel(data)
+model.polygon_metadata   # {"outline": [...], "hole_count": 1}（矩形资产回退 ROI 四角、洞数 0）
+```
+
+Rust 绑定同构：`train_polygon_model` / `suggest_contours` / `Model::polygon_metadata`
+（`PolygonTrainParams` / `PolygonVertex` / `PolygonMetadata`）。
+
+- **几何合同**：顶点须落在参考图坐标域内；外环不得自交或退化；外接矩形满足
+  24..4096 像素合同并作为姿态/画布/像素预算记账基（短边 <48px 时两级粗层无法
+  满足最小 ROI 合同，与矩形训练同一行为）；洞语义=训练特征提取期掩蔽
+  （洞内像素不产特征），洞间重叠按并集掩蔽不校验
+- **错误码**：几何非法返回 `VF_SHAPE_INVALID_POLYGON(17)`，params 为
+  [细分类型, 主参数, 次参数]（细分类型含义见头文件枚举注释）
+- **`vf_shape_suggest_contours` 返回值语义特殊**：≥0 为建议条数（0=无建议，
+  非错误），-1=可报告失败，-2=未分类原生失败
+- **容器兼容承诺**：多边形资产容器 meta 段携带可选 `poly` 键（归一化外环顶点+
+  洞分段+外接矩形）；**旧版本库加载多边形容器=合法**（忽略 poly 键、按外接矩形
+  回退解读，几何回读为外接矩形近似）；新版本库加载旧容器（无 poly 键）=矩形
+  语义不变；poly 键几何非法或与 cfg.roi 不一致按 MODEL_TAMPER/INVALID_POLYGON 拒绝
+- **耗时承诺**：1080P 参考图 + 35 位姿、外接矩形 ≤400px 的多边形训练 ≤2s
+  （实测基线见 tests/polygon_test.cpp 耗时背书用例）
 
 ## ABI 兼容合同（消费方对接必读）
 
@@ -113,9 +152,11 @@ model.close()?;                                   // 幂等；Drop 兜底
 - `benchmarks/run_facts.py`：**端到端确定性基准**（官方绑定 + shape-facts v1 合成事实帧）——帧 1 训练锚模板（±30°/5°、单尺度），对四帧匹配并对照 spec 预期真值（在场性 + 中心定位 ≤8px），输出训练/逐帧耗时。当前基线：训练 ~0.6s（13 位姿）、匹配 5–10ms/帧（1280×960）、四帧全过（中心偏差 <0.2px、零误报）
 - `benchmarks/shape-facts-v1/`：合成基准资产（4 帧确定性 PNG + 图案生成器源码 + 机器可读规格含预期真值与字节哈希）
 - `benchmarks/shape-matching-real48-v1/`：48 例真实素材基准（4 平移×8 旋转×2 亮度×2 噪声，含历史结果真值指纹与生成器源档）
-- `tests/`：C++ 单元回归（几何精修/帧准备/粗图/聚类，`-BuildTests` 启用）
+- `tests/`：C++ 单元回归（几何精修/帧准备/粗图/聚类/多边形训练与洞掩蔽，`-BuildTests` 启用）
 - `scripts/test_main_chain.py`：Python 绑定主链回归（训练→元数据→往返→容器篡改→批量→生命周期），
   `-BuildTests` 在装配完成后自动执行，为构建门禁一部分（需 python + numpy）
+- `scripts/test_polygon_chain.py`：Python 绑定多边形合同回归（多边形训练→元数据
+  往返→容器 poly 方言→suggest_contours，需 python + numpy）
 - `scripts/smoke_binding.py`：绑定加载冒烟（manifest 校验 + ABI 协商）
 - `bindings/rust/shape-sdk/tests/`：Rust 绑定回归（smoke + abi_chain 五组核心断言，
   对齐 `scripts/test_main_chain.py` 与 `tests/abi_chain_test.cpp`）+ `conformance.rs`

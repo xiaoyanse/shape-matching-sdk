@@ -2,6 +2,7 @@
 // 从 two_stage.cpp 按职责拆出（编解码归本单元，训练与匹配留在 two_stage 系）。
 
 #include "two_stage.hpp"
+#include "polygon.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -55,6 +56,12 @@ struct Meta {
     int ref_w = 0, ref_h = 0;
     bool has_cfg = false;
     vf_shape_train_config cfg{};
+    // 多边形资产可选键 poly：缺省=矩形资产；旧读端忽略本键、按外接矩形
+    // 回退解读（合同承诺）。出现时 ref/cfg 必须同时在。
+    bool has_poly = false;
+    int poly_x = 0, poly_y = 0, poly_w = 0, poly_h = 0;
+    std::vector<double> poly_outline;
+    std::vector<std::vector<double>> poly_holes;
 };
 
 Meta parse_meta(const std::string& json) {
@@ -131,6 +138,34 @@ Meta parse_meta(const std::string& json) {
         meta.cfg = c;
         meta.has_cfg = true;
     }
+    const auto poly = storage["poly"];
+    if (!poly.isNone()) {
+        require_coded(poly.isMap(), VF_SHAPE_MODEL_FORMAT, "invalid polygon metadata");
+        const auto bbox = poly["bbox"], outline = poly["outline"], holes = poly["holes"];
+        require_coded(bbox.isSeq() && bbox.size() == 4, VF_SHAPE_MODEL_FORMAT,
+                      "invalid polygon bbox metadata");
+        meta.poly_x = int(integer(bbox[0]));
+        meta.poly_y = int(integer(bbox[1]));
+        meta.poly_w = int(integer(bbox[2]));
+        meta.poly_h = int(integer(bbox[3]));
+        require_coded(outline.isSeq() && outline.size() >= 6 && outline.size() <= 128 &&
+                          outline.size() % 2 == 0,
+                      VF_SHAPE_MODEL_FORMAT, "invalid polygon outline metadata");
+        for (int i = 0; i < int(outline.size()); ++i)
+            meta.poly_outline.push_back(number(outline[i]));
+        require_coded(holes.isSeq() && holes.size() <= 8, VF_SHAPE_MODEL_FORMAT,
+                      "invalid polygon holes metadata");
+        for (int h = 0; h < int(holes.size()); ++h) {
+            const auto hole = holes[h];
+            require_coded(hole.isSeq() && hole.size() >= 6 && hole.size() <= 128 &&
+                              hole.size() % 2 == 0,
+                          VF_SHAPE_MODEL_FORMAT, "invalid polygon hole metadata");
+            std::vector<double> flat;
+            for (int i = 0; i < int(hole.size()); ++i) flat.push_back(number(hole[i]));
+            meta.poly_holes.push_back(std::move(flat));
+        }
+        meta.has_poly = true;
+    }
     return meta;
 }
 
@@ -157,6 +192,20 @@ std::string dump_meta(const TwoStageModel& model) {
             << c.roi_height << "," << c.angle_min << "," << c.angle_max << "," << c.angle_step
             << "," << c.scale_min << "," << c.scale_max << "," << c.scale_step << ","
             << c.weak_th << "," << c.strong_th << "," << c.feature_count << "]";
+        if (model.polygon) {
+            out << ",\"poly\":{\"bbox\":[" << c.roi_x << "," << c.roi_y << "," << c.roi_width
+                << "," << c.roi_height << "],\"outline\":[";
+            for (size_t i = 0; i < model.polygon->outline.size(); ++i)
+                out << (i ? "," : "") << model.polygon->outline[i];
+            out << "],\"holes\":[";
+            for (size_t h = 0; h < model.polygon->holes.size(); ++h) {
+                out << (h ? "," : "") << "[";
+                for (size_t i = 0; i < model.polygon->holes[h].size(); ++i)
+                    out << (i ? "," : "") << model.polygon->holes[h][i];
+                out << "]";
+            }
+            out << "]}";
+        }
     }
     out << "}";
     return out.str();
@@ -304,6 +353,29 @@ std::shared_ptr<TwoStageModel> decode_two_stage(const uint8_t* bytes, uint64_t s
         // 旧容器无原始配置键：回退现行为——第一组 fine 的派生配置冒充原配置
         //（角度已细分、缩放已归一），ref=0 标记派生语义；旧资产仍可加载
         model->base_config = model->fines.front()->config;
+    }
+    if (meta.has_poly) {
+        require_coded(meta.has_cfg, VF_SHAPE_MODEL_TAMPER,
+                      "polygon metadata without original config");
+        // poly 段几何重校验（与训练同口径，防篡改洗白）+ 外接矩形与 cfg.roi
+        // 逐项一致（双端为整数，精确口径，严于 1e-9 容差）
+        const PolygonShape shape = validate_polygon_vertices(
+            unflatten_vertices(meta.poly_outline), unflatten_holes(meta.poly_holes),
+            meta.ref_w, meta.ref_h);
+        require_coded(shape.bounds.x == meta.cfg.roi_x && shape.bounds.y == meta.cfg.roi_y &&
+                          shape.bounds.width == meta.cfg.roi_width &&
+                          shape.bounds.height == meta.cfg.roi_height,
+                      VF_SHAPE_MODEL_TAMPER,
+                      "polygon bounding box disagrees with original training ROI");
+        require_coded(meta.poly_x == shape.bounds.x && meta.poly_y == shape.bounds.y &&
+                          meta.poly_w == shape.bounds.width &&
+                          meta.poly_h == shape.bounds.height,
+                      VF_SHAPE_MODEL_TAMPER,
+                      "polygon bbox metadata disagrees with polygon outline");
+        auto asset = std::make_shared<PolygonAsset>();
+        asset->outline = meta.poly_outline;
+        asset->holes = meta.poly_holes;
+        model->polygon = std::move(asset);
     }
     model->b7 = extract_b7_points(model->tmpl_gray);
     return model;

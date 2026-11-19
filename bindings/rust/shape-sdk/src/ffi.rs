@@ -12,6 +12,7 @@ use libloading::Library;
 
 use crate::diagnostics::{EstimateTrainingFn, LastErrorInfoFn, LastMatchInfoFn};
 use crate::error::ShapeError;
+use crate::polygon::{PolygonMetadataFn, SuggestContoursFn, TrainPolygonFn};
 
 /// 原生入口错误缓冲容量（对齐 Python 绑定的 2048 字节）
 const ERROR_CAPACITY: usize = 2048;
@@ -163,6 +164,10 @@ pub(crate) struct NativeAbi {
     pub(crate) estimate_fn: Option<EstimateTrainingFn>,
     pub(crate) last_match_fn: Option<LastMatchInfoFn>,
     pub(crate) last_error_fn: Option<LastErrorInfoFn>,
+    // 多边形三导出同为加性（批3）：缺失容忍，多边形 API 调用处报错
+    pub(crate) train_polygon_fn: Option<TrainPolygonFn>,
+    pub(crate) suggest_contours_fn: Option<SuggestContoursFn>,
+    pub(crate) polygon_metadata_fn: Option<PolygonMetadataFn>,
 }
 
 /// 装载动态库。Windows 侧显式搜索 DLL 自身目录（同目录 opencv 依赖）与
@@ -232,6 +237,15 @@ impl NativeAbi {
                 estimate_fn: library.get(b"vf_shape_estimate_training\0").ok().map(|s| *s),
                 last_match_fn: library.get(b"vf_shape_last_match_info\0").ok().map(|s| *s),
                 last_error_fn: library.get(b"vf_shape_last_error_info\0").ok().map(|s| *s),
+                train_polygon_fn: library.get(b"vf_shape_train_polygon\0").ok().map(|s| *s),
+                suggest_contours_fn: library
+                    .get(b"vf_shape_suggest_contours\0")
+                    .ok()
+                    .map(|s| *s),
+                polygon_metadata_fn: library
+                    .get(b"vf_shape_polygon_metadata\0")
+                    .ok()
+                    .map(|s| *s),
                 library,
             })
         }

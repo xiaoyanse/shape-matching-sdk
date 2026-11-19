@@ -42,6 +42,7 @@ MODEL_FORMAT = 13
 MODEL_SIZE = 14
 MODEL_TAMPER = 15
 SEARCH_BUDGET = 16
+INVALID_POLYGON = 17
 INTERNAL = 99
 
 ERROR_CODES = {
@@ -62,6 +63,7 @@ ERROR_CODES = {
     "MODEL_SIZE": MODEL_SIZE,
     "MODEL_TAMPER": MODEL_TAMPER,
     "SEARCH_BUDGET": SEARCH_BUDGET,
+    "INVALID_POLYGON": INVALID_POLYGON,
     "INTERNAL": INTERNAL,
 }
 
@@ -85,6 +87,8 @@ _CODE_MESSAGES = {
     MODEL_SIZE: "模型资产尺寸超预算 ≤32MiB（参数：字节数,上限）",
     MODEL_TAMPER: "模型资产校验失败：内容与容器合同不符或被篡改",
     SEARCH_BUDGET: "匹配搜索预算超限：姿态数×搜索块数过多（参数：用量,上限）",
+    INVALID_POLYGON: "多边形训练参数非法：顶点 3–64 且在图域内、无自交；洞 ≤8、"
+    "每洞面积 ≥64px² 且完全在外环内（参数：细分类型,主参数,次参数）",
     INTERNAL: "未分类内部错误",
 }
 
