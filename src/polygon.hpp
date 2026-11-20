@@ -59,9 +59,21 @@ std::vector<cv::Point2d> unflatten_vertices(const std::vector<double>& flat);
 std::vector<std::vector<cv::Point2d>> unflatten_holes(
     const std::vector<std::vector<double>>& flats);
 
-// 轮廓建议（vf_shape_suggest_contours 实现）；返回建议条数
+// 掩码面积（外环面积−各洞面积绝对值直减，洞间重叠不消重）；预算 fill ratio 用
+double polygon_mask_area(const PolygonShape& polygon);
+
+// 预算查询 _ex（vf_shape_estimate_training_ex 实现）：params 空=矩形路径同
+// estimate_training；非空=多边形路径（params 全量字段为准，formula_version=2
+// + polygon_fill_ratio）。落在本翻译单元以保持既有测试目标的源文件组合不变
+vf_shape_budget_report estimate_training_ex(const vf_shape_train_config& config,
+                                            int width, int height,
+                                            const vf_shape_polygon_train_params* params);
+
+// 轮廓建议（vf_shape_suggest_contours/_ex 实现）；返回建议条数。params 为空
+// 或字段零值时取默认（Canny 50/150、epsilon 0.02×周长），v1 路径传空指针
 uint32_t suggest_contours(const cv::Mat& image, const int32_t* roi_hint,
                           uint32_t max_suggestions, uint32_t max_vertices_per,
+                          const vf_shape_suggest_params* params,
                           vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts);
 
 }

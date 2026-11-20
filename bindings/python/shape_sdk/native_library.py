@@ -84,6 +84,11 @@ class BatchItem(ct.Structure):
 
 
 class BudgetReport(ct.Structure):
+    """vf_shape_budget_report（v2 布局，尾部含 polygon_fill_ratio）。
+
+    原生端兼容 v1（追加前 64 字节）与 v2 两种 struct_size；formula_version=1
+    时 polygon_fill_ratio 不构成消费承诺（矩形路径为 1.0）。"""
+
     _fields_ = [
         ("struct_size", ct.c_uint32),
         ("formula_version", ct.c_uint32),
@@ -97,6 +102,7 @@ class BudgetReport(ct.Structure):
         ("pixel_used", ct.c_uint64),
         ("pixel_limit", ct.c_uint64),
         ("over_budget", ct.c_int32),
+        ("polygon_fill_ratio", ct.c_double),
     ]
 
 
@@ -121,6 +127,21 @@ class Vertex(ct.Structure):
     ]
 
 
+def vertex_array(points) -> ct.Array:
+    """序列 (x, y) → Vertex 数组；轻量校验（几何终审在原生端）。"""
+    items = list(points)
+    if not 3 <= len(items) <= 64:
+        raise NativeShapeError("轮廓顶点数须在 3–64")
+    array = (Vertex * len(items))()
+    for index, point in enumerate(items):
+        x, y = point
+        if not (isinstance(x, (int, float)) and isinstance(y, (int, float))):
+            raise NativeShapeError("顶点坐标须为数值")
+        array[index].x = float(x)
+        array[index].y = float(y)
+    return array
+
+
 class Polygon(ct.Structure):
     _fields_ = [
         ("vertices", ct.POINTER(Vertex)),
@@ -143,6 +164,17 @@ class PolygonTrainParams(ct.Structure):
         ("weak_th", ct.c_double),
         ("strong_th", ct.c_double),
         ("feature_count", ct.c_int32),
+    ]
+
+
+class SuggestParams(ct.Structure):
+    """vf_shape_suggest_params：0 值字段=原生默认（Canny 50/150、epsilon 0.02）。"""
+
+    _fields_ = [
+        ("struct_size", ct.c_uint32),
+        ("canny_low", ct.c_double),
+        ("canny_high", ct.c_double),
+        ("epsilon_factor", ct.c_double),
     ]
 
 
@@ -368,6 +400,38 @@ def load_library() -> ct.CDLL:
             if function is None:
                 continue
             function.argtypes = audit_signatures[name]
+            function.restype = ct.c_int32
+        # P2/P3 参数化与预算 v2 导出同为加性：旧运行时缺失不阻断装载，调用处报错
+        ex_signatures = {
+            "suggest_contours_ex": image + [
+                ct.POINTER(ct.c_int32),
+                ct.c_uint32,
+                ct.c_uint32,
+                ct.POINTER(SuggestParams),
+                ct.POINTER(Vertex),
+                ct.POINTER(ct.c_uint32),
+            ]
+            + error,
+            "estimate_training_ex": [
+                ct.POINTER(TrainConfig),
+                ct.c_int32,
+                ct.c_int32,
+                ct.POINTER(PolygonTrainParams),
+                ct.POINTER(BudgetReport),
+            ]
+            + error,
+        }
+        ex = {}
+        for name, signature in ex_signatures.items():
+            try:
+                ex[name] = getattr(library, f"vf_shape_{name}")
+            except AttributeError:
+                ex[name] = None
+        library._ex_exports = all(value is not None for value in ex.values())
+        for name, function in ex.items():
+            if function is None:
+                continue
+            function.argtypes = ex_signatures[name]
             function.restype = ct.c_int32
         _library = library
         return library

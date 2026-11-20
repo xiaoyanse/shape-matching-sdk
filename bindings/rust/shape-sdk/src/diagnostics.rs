@@ -7,7 +7,7 @@ use crate::ffi::{NativeAbi, TrainConfigAbi};
 use crate::library::{train_config_abi, ShapeLibrary};
 use crate::model::{Model, TrainParams};
 
-/// 训练预算账本（vf_shape_budget_report）
+/// 训练预算账本（vf_shape_budget_report，v2 布局：尾部 polygon_fill_ratio）
 #[repr(C)]
 pub(crate) struct BudgetReportAbi {
     pub struct_size: u32,
@@ -22,6 +22,7 @@ pub(crate) struct BudgetReportAbi {
     pub pixel_used: u64,
     pub pixel_limit: u64,
     pub over_budget: i32,
+    pub polygon_fill_ratio: f64,
 }
 
 impl Default for BudgetReportAbi {
@@ -39,6 +40,7 @@ impl Default for BudgetReportAbi {
             pixel_used: 0,
             pixel_limit: 0,
             over_budget: 0,
+            polygon_fill_ratio: 0.0,
         }
     }
 }
@@ -81,6 +83,15 @@ pub(crate) type EstimateTrainingFn = unsafe extern "C" fn(
     *mut u8,
     u32,
 ) -> i32;
+pub(crate) type EstimateTrainingExFn = unsafe extern "C" fn(
+    *const TrainConfigAbi,
+    i32,
+    i32,
+    *const crate::polygon::PolygonParamsAbi,
+    *mut BudgetReportAbi,
+    *mut u8,
+    u32,
+) -> i32;
 pub(crate) type LastMatchInfoFn = unsafe extern "C" fn(u64, *mut MatchTraceAbi, *mut u8, u32) -> i32;
 /// 无失败路径：void 返回，三出口指针均可为空
 pub(crate) type LastErrorInfoFn = unsafe extern "C" fn(*mut i32, *mut f64, *mut i32);
@@ -108,6 +119,27 @@ impl NativeAbi {
         let status = unsafe {
             (estimate)(config, image_w, image_h, report, error.as_mut_ptr(),
                        ERROR_CAPACITY as u32)
+        };
+        ShapeError::check(status, &error)
+    }
+
+    /// 预算查询 _ex：polygon 为空指针时与矩形路径完全一致，非空走多边形核算
+    pub(crate) fn estimate_training_ex(
+        &self,
+        config: &TrainConfigAbi,
+        image_w: i32,
+        image_h: i32,
+        polygon: *const crate::polygon::PolygonParamsAbi,
+        report: &mut BudgetReportAbi,
+    ) -> Result<(), ShapeError> {
+        let estimate_ex = self
+            .estimate_ex_fn
+            .ok_or_else(|| missing_export("vf_shape_estimate_training_ex"))?;
+        let mut error = [0u8; ERROR_CAPACITY];
+        // SAFETY: config/polygon/report 均在调用期间借用；report struct_size 预设。
+        let status = unsafe {
+            (estimate_ex)(config, image_w, image_h, polygon, report, error.as_mut_ptr(),
+                          ERROR_CAPACITY as u32)
         };
         ShapeError::check(status, &error)
     }
@@ -149,7 +181,9 @@ pub struct LastErrorInfo {
 }
 
 /// 训练预算账本：三账本用量/上限/超限标志 + 首要超限因子（0=未超限，
-/// 否则 `error_code` 的 POSE_BUDGET/CANVAS_BUDGET/PIXEL_BUDGET）
+/// 否则 `error_code` 的 POSE_BUDGET/CANVAS_BUDGET/PIXEL_BUDGET）。
+/// polygon_fill_ratio 仅 formula_version=2 时构成消费承诺（掩码面积/外接矩形
+/// 面积比）；矩形路径恒 1.0。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BudgetReport {
     pub formula_version: u32,
@@ -163,6 +197,16 @@ pub struct BudgetReport {
     pub pixel_limit: u64,
     pub pixel_over: bool,
     pub over_budget: i32,
+    pub polygon_fill_ratio: f64,
+}
+
+/// 预算查询输入形态（vf_shape_estimate_training_ex 的 config/params 二选一语义）
+#[derive(Debug, Clone, Copy)]
+pub enum TrainingShape<'a> {
+    /// 矩形 ROI 训练参数（formula_version=1，与 `estimate_training` 一致）
+    Rect(&'a TrainParams),
+    /// 多边形掩码训练参数（与 `train_polygon_model` 同参语义，formula_version=2）
+    Polygon(&'a crate::polygon::PolygonTrainParams),
 }
 
 /// 最近一次匹配诊断快照：计数常开；毫秒仅诊断计时构建非 0（合同）
@@ -176,6 +220,23 @@ pub struct MatchTrace {
     pub coarse_resize_ms: f64,
     pub windows_ms: f64,
     pub finish_ms: f64,
+}
+
+fn budget_from_abi(report: &BudgetReportAbi) -> BudgetReport {
+    BudgetReport {
+        formula_version: report.formula_version,
+        pose_used: report.pose_used,
+        pose_limit: report.pose_limit,
+        pose_over: report.pose_over != 0,
+        canvas_used: report.canvas_used,
+        canvas_limit: report.canvas_limit,
+        canvas_over: report.canvas_over != 0,
+        pixel_used: report.pixel_used,
+        pixel_limit: report.pixel_limit,
+        pixel_over: report.pixel_over != 0,
+        over_budget: report.over_budget,
+        polygon_fill_ratio: report.polygon_fill_ratio,
+    }
 }
 
 impl ShapeLibrary {
@@ -205,19 +266,52 @@ impl ShapeLibrary {
         let mut report = BudgetReportAbi::default();
         self.abi()
             .estimate_training(&config, image_w, image_h, &mut report)?;
-        Ok(BudgetReport {
-            formula_version: report.formula_version,
-            pose_used: report.pose_used,
-            pose_limit: report.pose_limit,
-            pose_over: report.pose_over != 0,
-            canvas_used: report.canvas_used,
-            canvas_limit: report.canvas_limit,
-            canvas_over: report.canvas_over != 0,
-            pixel_used: report.pixel_used,
-            pixel_limit: report.pixel_limit,
-            pixel_over: report.pixel_over != 0,
-            over_budget: report.over_budget,
-        })
+        Ok(budget_from_abi(&report))
+    }
+
+    /// 多边形训练预算查询（_ex）：矩形路径与 `estimate_training` 逐字段一致；
+    /// 多边形路径与 `train_polygon_model` 同参语义，formula_version=2。
+    /// 注意 polygon 路径 ABI 层仍要求 config 指针合法——本方法按合同传仅含
+    /// struct_size 的壳配置（原生端多边形路径不消费其字段）。
+    pub fn estimate_training_ex(
+        &self,
+        image_w: i32,
+        image_h: i32,
+        shape: TrainingShape<'_>,
+    ) -> Result<BudgetReport, ShapeError> {
+        // 多边形路径的壳配置：仅承担 ABI 结构校验，字段不参与核算
+        let mut config = TrainConfigAbi {
+            struct_size: std::mem::size_of::<TrainConfigAbi>() as u32,
+            ..TrainConfigAbi::default()
+        };
+        let polygon_storage: (
+            crate::polygon::PolygonParamsAbi,
+            Vec<crate::polygon::VertexAbi>,
+            Vec<Vec<crate::polygon::VertexAbi>>,
+            Vec<crate::polygon::PolygonAbi>,
+        );
+        let polygon_ptr = match shape {
+            TrainingShape::Rect(params) => {
+                params.validate()?;
+                let (feature_count, weak_th, strong_th) = match &params.detector {
+                    None => (0, 0.0, 0.0),
+                    Some(detector) => {
+                        (detector.feature_count, detector.weak_th, detector.strong_th)
+                    }
+                };
+                config = train_config_abi(params, feature_count, weak_th, strong_th);
+                std::ptr::null()
+            }
+            TrainingShape::Polygon(params) => {
+                crate::polygon::validate_polygon_params(params)?;
+                polygon_storage = crate::polygon::build_params_abi(params);
+                &polygon_storage.0
+            }
+        };
+        let mut report = BudgetReportAbi::default();
+        self.abi()
+            .estimate_training_ex(&config, image_w, image_h, polygon_ptr, &mut report)?;
+        Ok(budget_from_abi(&report))
     }
 }
 
@@ -242,8 +336,8 @@ impl Model {
     }
 }
 
-// 编译期布局核对（64 位平台口径，含尾部对齐填充）
-const _: () = assert!(std::mem::size_of::<BudgetReportAbi>() == 64);
+// 编译期布局核对（64 位平台口径，含尾部对齐填充；v2 尾部追加 fill ratio 后为 72）
+const _: () = assert!(std::mem::size_of::<BudgetReportAbi>() == 72);
 const _: () = assert!(std::mem::size_of::<MatchTraceAbi>() == 112);
 
 #[cfg(test)]

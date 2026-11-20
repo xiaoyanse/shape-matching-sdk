@@ -196,14 +196,20 @@ typedef enum {
     VF_SHAPE_INTERNAL = 99
 } vf_shape_error_code;
 
-/* 训练预算账本（vf_shape_estimate_training 输出）。
- * formula_version：预算公式版本，当前恒为 1；核算公式变化时递增。
+/* 训练预算账本（vf_shape_estimate_training / _ex 输出）。版本演进规则：
+ * 尾部加性追加 + formula_version 递增，既有字段语义与偏移永不变化。
+ * formula_version：预算公式版本。矩形核算路径恒为 1（含 _ex 矩形路径，与
+ *   旧入口逐字段一致）；仅 _ex 多边形路径报 2，消费方按版本分支。
  * pose_used/pose_limit：角度×缩放档位总数与其上限（350）。
  * canvas_used/canvas_limit：缩放后最大画布单边像素与其上限（4096）。
  * pixel_used/pixel_limit：全部姿态画布像素总量与其上限（2.5e8）。
  * pose_over/canvas_over/pixel_over：0/1，该账本是否超限；超限账本仍报告
  *   实际用量。over_budget：首要超限因子，判定顺序与训练拒绝顺序一致
  *   （POSE_BUDGET → CANVAS_BUDGET → PIXEL_BUDGET），未超限为 VF_SHAPE_OK。
+ * polygon_fill_ratio（v2 尾部追加，formula_version=2 时有效）：多边形掩码
+ *   面积/外接矩形面积比（外环面积−各洞面积绝对值直减，洞间重叠不消重，
+ *   建议性密度提示非合同值）；矩形路径=1.0。struct_size 兼容两种布局：
+ *   v1（追加前，64 字节，库只回写前缀字段）与 v2（追加后，72 字节）。
  */
 typedef struct {
     uint32_t struct_size;
@@ -213,6 +219,7 @@ typedef struct {
     uint32_t pixel_over;
     uint64_t pixel_used, pixel_limit;
     int32_t over_budget;
+    double polygon_fill_ratio;
 } vf_shape_budget_report;
 
 /* 最近一次匹配的诊断快照（vf_shape_last_match_info 输出）。
@@ -372,6 +379,17 @@ VF_SHAPE_API int32_t vf_shape_estimate_training(const vf_shape_train_config* con
     int32_t image_w, int32_t image_h, vf_shape_budget_report* out,
     char* error, uint32_t error_capacity);
 
+/* 多边形训练预算查询（_ex）：params=NULL 时与 vf_shape_estimate_training
+ * 完全一致（formula_version=1、逐字段相等）；params 非空时按多边形路径核算
+ * ——与 vf_shape_train_polygon 同参语义（params 全量字段为准，config 仅承担
+ * 结构校验不参与核算）：validate_polygon 几何校验（INVALID_POLYGON 复用
+ * 细分）、外接矩形记账（与矩形训练同式同序）、formula_version=2 且
+ * polygon_fill_ratio 有效。out->struct_size 接受 v1/v2 两种布局，库按其
+ * 只回写前缀字段。 */
+VF_SHAPE_API int32_t vf_shape_estimate_training_ex(const vf_shape_train_config* config,
+    int32_t image_w, int32_t image_h, const vf_shape_polygon_train_params* params,
+    vf_shape_budget_report* out, char* error, uint32_t error_capacity);
+
 /* 多边形模板训练：与 vf_shape_train 同链路（两级容器模型），仅把训练掩码从
  * 矩形 ROI 换为多边形（外环填充、洞掩蔽），位姿映射/预算/导出/加载/匹配
  * 全部复用矩形路径（外接矩形即 ROI）。成功后 *handle 为新句柄；导出为容器
@@ -396,6 +414,30 @@ VF_SHAPE_API int32_t vf_shape_suggest_contours(const uint8_t* image, uint64_t im
     int32_t width, int32_t height, uint64_t stride,
     const int32_t roi_hint[4],
     uint32_t max_suggestions, uint32_t max_vertices_per,
+    vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts,
+    char* error, uint32_t error_capacity);
+
+/* 轮廓建议参数（vf_shape_suggest_contours_ex 输入，NULL=全默认）。
+ * struct_size 必须先置为 sizeof(vf_shape_suggest_params)。
+ * canny_low/canny_high：Canny 迟滞阈，0=默认 50/150；非零须为有限正数且
+ *   生效值满足 high≥low（默认参与比较）。阈值语义与训练 detector 三参同类
+ *   （正且递增的边缘阈值族），越界拒绝码 VF_SHAPE_DETECTOR_PARAMS：can­ny_low
+ *   非法 params=[canny_low]；high<low params=[生效 low,生效 high]。
+ * epsilon_factor：多边形逼近精度（×轮廓周长，0=默认 0.02），有效域
+ *   [0.001,0.2]；越界拒绝码 VF_SHAPE_DETECTOR_PARAMS，params=[epsilon,下界,上界]。 */
+typedef struct {
+    uint32_t struct_size;
+    double canny_low, canny_high;
+    double epsilon_factor;
+} vf_shape_suggest_params;
+
+/* 参数化轮廓建议：行为与 vf_shape_suggest_contours 一致，仅阈值与逼近精度
+ * 可调（params=NULL 时两者逐字节一致）。其余合同（返回值 ≥0 条数/-1/-2 分层、
+ * 确定性、缓冲容量）见 vf_shape_suggest_contours。 */
+VF_SHAPE_API int32_t vf_shape_suggest_contours_ex(const uint8_t* image, uint64_t image_size,
+    int32_t width, int32_t height, uint64_t stride, const int32_t roi_hint[4],
+    uint32_t max_suggestions, uint32_t max_vertices_per,
+    const vf_shape_suggest_params* params,
     vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts,
     char* error, uint32_t error_capacity);
 

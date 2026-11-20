@@ -300,12 +300,40 @@ void vf_shape_last_error_info(int32_t* code, double params[6], int32_t* param_co
     if (params)
         std::copy_n(vfshape::g_last_error.params, 6, params);
 }
+// 预算报告 v1 布局尺寸（polygon_fill_ratio 尾部追加前）：新头部 sizeof=72，
+// 旧头部消费方仍传 64；入口按 struct_size 判别，只回写调用方声明长度的前缀
+constexpr uint32_t kBudgetReportV1Size = 64;
+static_assert(sizeof(vf_shape_budget_report) ==
+              kBudgetReportV1Size + sizeof(double));
+
+void require_budget_report_size(const vf_shape_budget_report& out) {
+    vfshape::require(out.struct_size == sizeof(vf_shape_budget_report) ||
+                         out.struct_size == kBudgetReportV1Size,
+                     "invalid budget report output ABI");
+}
+
+void copy_budget_report(vf_shape_budget_report& out, const vf_shape_budget_report& report) {
+    std::memcpy(&out, &report, std::min(sizeof(out), size_t(out.struct_size)));
+}
+
 int32_t vf_shape_estimate_training(const vf_shape_train_config* config, int32_t image_w,
     int32_t image_h, vf_shape_budget_report* out, char* error, uint32_t capacity) {
     return boundary(error, capacity, [&] {
         vfshape::require(config && out, "missing budget report output/config");
-        vfshape::require(out->struct_size == sizeof(*out), "invalid budget report output ABI");
-        *out = vfshape::estimate_training(*config, image_w, image_h);
+        require_budget_report_size(*out);
+        copy_budget_report(*out, vfshape::estimate_training(*config, image_w, image_h));
+    });
+}
+int32_t vf_shape_estimate_training_ex(const vf_shape_train_config* config, int32_t image_w,
+    int32_t image_h, const vf_shape_polygon_train_params* params,
+    vf_shape_budget_report* out, char* error, uint32_t capacity) {
+    return boundary(error, capacity, [&] {
+        vfshape::require(config && out, "missing budget report output/config");
+        vfshape::require(config->struct_size == sizeof(*config),
+                         "invalid training ABI structure size");
+        require_budget_report_size(*out);
+        copy_budget_report(*out, vfshape::estimate_training_ex(*config, image_w, image_h,
+                                                               params));
     });
 }
 int32_t vf_shape_train_polygon(const uint8_t* image, uint64_t image_size, int32_t width,
@@ -323,9 +351,10 @@ int32_t vf_shape_train_polygon(const uint8_t* image, uint64_t image_size, int32_
     });
 }
 // 建议条数为返回值（0=无建议非错误），失败走负值分层：-1 可报告 / -2 未分类
-int32_t vf_shape_suggest_contours(const uint8_t* image, uint64_t image_size, int32_t width,
-    int32_t height, uint64_t stride, const int32_t* roi_hint, uint32_t max_suggestions,
-    uint32_t max_vertices_per, vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts,
+int32_t suggest_boundary(const vf_shape_suggest_params* params, const uint8_t* image,
+    uint64_t image_size, int32_t width, int32_t height, uint64_t stride,
+    const int32_t* roi_hint, uint32_t max_suggestions, uint32_t max_vertices_per,
+    vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts,
     char* error, uint32_t error_capacity) {
     if (error && error_capacity) error[0] = '\0';
     const uint64_t scope = vfshape::begin_error_scope();
@@ -333,7 +362,7 @@ int32_t vf_shape_suggest_contours(const uint8_t* image, uint64_t image_size, int
         vfshape::require(out_vertices && out_vertex_counts, "missing suggestion output buffers");
         const auto frame = vfshape::checked_image(image, image_size, width, height, stride);
         return int32_t(vfshape::suggest_contours(frame, roi_hint, max_suggestions,
-                                                 max_vertices_per, out_vertices,
+                                                 max_vertices_per, params, out_vertices,
                                                  out_vertex_counts));
     } catch (const std::exception& ex) {
         vfshape::finish_error_scope(scope);
@@ -345,6 +374,23 @@ int32_t vf_shape_suggest_contours(const uint8_t* image, uint64_t image_size, int
             copy_error(error, error_capacity, "unknown native matching failure");
         return -2;
     }
+}
+int32_t vf_shape_suggest_contours(const uint8_t* image, uint64_t image_size, int32_t width,
+    int32_t height, uint64_t stride, const int32_t* roi_hint, uint32_t max_suggestions,
+    uint32_t max_vertices_per, vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts,
+    char* error, uint32_t error_capacity) {
+    return suggest_boundary(nullptr, image, image_size, width, height, stride, roi_hint,
+                            max_suggestions, max_vertices_per, out_vertices,
+                            out_vertex_counts, error, error_capacity);
+}
+int32_t vf_shape_suggest_contours_ex(const uint8_t* image, uint64_t image_size, int32_t width,
+    int32_t height, uint64_t stride, const int32_t* roi_hint, uint32_t max_suggestions,
+    uint32_t max_vertices_per, const vf_shape_suggest_params* params,
+    vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts,
+    char* error, uint32_t error_capacity) {
+    return suggest_boundary(params, image, image_size, width, height, stride, roi_hint,
+                            max_suggestions, max_vertices_per, out_vertices,
+                            out_vertex_counts, error, error_capacity);
 }
 int32_t vf_shape_polygon_metadata(uint64_t handle, vf_shape_vertex* outline, uint32_t capacity,
     uint32_t* outline_count, uint32_t* hole_count, char* error, uint32_t error_capacity) {

@@ -1,7 +1,7 @@
-//! 多边形模板能力安全层：训练参数、多边形训练、轮廓建议、多边形元数据回读。
+//! 多边形模板能力安全层：训练参数、多边形训练、多边形元数据回读。
 //! ABI 结构与 unsafe 边界在本模块闭环；布局合同见 include/shape_matching.h。
-//! 三个导出同为加性（旧运行时缺失容忍，调用处报错），语义对齐 Python 侧
-//! native.py 的多边形接口。
+//! 导出为加性（旧运行时缺失容忍，调用处报错），语义对齐 Python 侧
+//! native.py 的多边形接口。轮廓建议族在 `suggest` 模块。
 
 use crate::error::ShapeError;
 use crate::ffi::NativeAbi;
@@ -92,20 +92,6 @@ pub(crate) type TrainPolygonFn = unsafe extern "C" fn(
     *mut u8,
     u32,
 ) -> i32;
-pub(crate) type SuggestContoursFn = unsafe extern "C" fn(
-    *const u8,
-    u64,
-    i32,
-    i32,
-    u64,
-    *const i32,
-    u32,
-    u32,
-    *mut VertexAbi,
-    *mut u32,
-    *mut u8,
-    u32,
-) -> i32;
 pub(crate) type PolygonMetadataFn =
     unsafe extern "C" fn(u64, *mut VertexAbi, u32, *mut u32, *mut u32, *mut u8, u32) -> i32;
 
@@ -147,45 +133,6 @@ impl NativeAbi {
         Ok(handle)
     }
 
-    /// 轮廓建议：返回原始返回码（≥0=建议条数，负=失败已带文本）
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn suggest_contours(
-        &self,
-        image: &BgrImage<'_>,
-        roi_hint: *const i32,
-        max_suggestions: u32,
-        max_vertices_per: u32,
-        vertices: &mut [VertexAbi],
-        counts: &mut [u32],
-    ) -> Result<i32, ShapeError> {
-        let suggest = self
-            .suggest_contours_fn
-            .ok_or_else(|| missing_polygon_export("vf_shape_suggest_contours"))?;
-        let mut error = [0u8; ERROR_CAPACITY];
-        // SAFETY: 输入图/顶点/计数缓冲均在调用期间借用，容量一致传递。
-        let status = unsafe {
-            (suggest)(
-                image.data().as_ptr(),
-                image.data().len() as u64,
-                image.width(),
-                image.height(),
-                3 * image.width() as u64,
-                roi_hint,
-                max_suggestions,
-                max_vertices_per,
-                vertices.as_mut_ptr(),
-                counts.as_mut_ptr(),
-                error.as_mut_ptr(),
-                ERROR_CAPACITY as u32,
-            )
-        };
-        if status < 0 {
-            // 负值分层：-1 可报告 / -2 未分类，镜像正域 status 码
-            return Err(ShapeError::native(-status, &error));
-        }
-        Ok(status)
-    }
-
     /// 多边形元数据回读（两次调用模式由调用方编排）
     pub(crate) fn polygon_metadata(
         &self,
@@ -215,7 +162,7 @@ impl NativeAbi {
     }
 }
 
-fn validate_polygon_params(params: &PolygonTrainParams) -> Result<(), ShapeError> {
+pub(crate) fn validate_polygon_params(params: &PolygonTrainParams) -> Result<(), ShapeError> {
     let invalid = || {
         ShapeError::InvalidInput(
             "多边形轮廓须为 3–64 顶点、洞 ≤8 且每洞 3–64 顶点，坐标须为有限数值".into(),
@@ -236,7 +183,7 @@ fn validate_polygon_params(params: &PolygonTrainParams) -> Result<(), ShapeError
 
 /// 安全参数 → ABI 结构；返回的存储必须与 ABI 同寿命（顶点数组被其借用）。
 /// 洞存储先收集完整再建视图：Vec 生长会重定位，视图必须指向最终稳定缓冲。
-fn build_params_abi(
+pub(crate) fn build_params_abi(
     params: &PolygonTrainParams,
 ) -> (
     PolygonParamsAbi,
@@ -292,49 +239,6 @@ pub fn train_polygon_model(
     params: &PolygonTrainParams,
 ) -> Result<Vec<u8>, ShapeError> {
     ShapeLibrary::global()?.train_polygon_model(reference, params)
-}
-
-/// 轮廓建议：返回建议集合（每条为顶点数组，原图坐标系）；空集=无建议非错误。
-/// roi_hint 为 xywh 先验框（须完整落在图内），None=全图；max_vertices_per
-/// 限每条顶点数 3..64，max_suggestions 1..256。
-pub fn suggest_contours(
-    image: BgrImage<'_>,
-    roi_hint: Option<[i32; 4]>,
-    max_suggestions: u32,
-    max_vertices_per: u32,
-) -> Result<Vec<Vec<PolygonVertex>>, ShapeError> {
-    if !(1..=256).contains(&max_suggestions) {
-        return Err(ShapeError::InvalidInput("建议条数须为 1–256".into()));
-    }
-    if !(3..=64).contains(&max_vertices_per) {
-        return Err(ShapeError::InvalidInput("每条建议顶点数须为 3–64".into()));
-    }
-    let mut vertices =
-        vec![VertexAbi { x: 0.0, y: 0.0 }; max_suggestions as usize * max_vertices_per as usize];
-    let mut counts = vec![0u32; max_suggestions as usize];
-    let count = ShapeLibrary::global()?.abi().suggest_contours(
-        &image,
-        roi_hint
-            .as_ref()
-            .map_or(std::ptr::null(), |rect| rect.as_ptr()),
-        max_suggestions,
-        max_vertices_per,
-        &mut vertices,
-        &mut counts,
-    )?;
-    let mut suggestions = Vec::with_capacity(count as usize);
-    let mut offset = 0usize;
-    for count_per in counts.iter().take(count as usize) {
-        let end = offset + *count_per as usize;
-        suggestions.push(
-            vertices[offset..end]
-                .iter()
-                .map(|v| PolygonVertex { x: v.x, y: v.y })
-                .collect(),
-        );
-        offset = end;
-    }
-    Ok(suggestions)
 }
 
 impl ShapeLibrary {

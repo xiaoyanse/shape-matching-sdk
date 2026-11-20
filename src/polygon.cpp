@@ -241,6 +241,29 @@ PolygonShape validate_polygon(const vf_shape_polygon_train_params& params,
     return validate_polygon_vertices(std::move(outline), std::move(holes), width, height);
 }
 
+double polygon_mask_area(const PolygonShape& polygon) {
+    double area = std::abs(signed_area(polygon.outline));
+    for (const auto& hole : polygon.holes) area -= std::abs(signed_area(hole));
+    return std::max(0.0, area);
+}
+
+vf_shape_budget_report estimate_training_ex(const vf_shape_train_config& config, int width,
+                                            int height,
+                                            const vf_shape_polygon_train_params* params) {
+    if (!params) return estimate_training(config, width, height);
+    // 多边形路径与 vf_shape_train_polygon 同参语义：params 全量字段为准，
+    // config 在该路径不参与核算（合同见公共头 _ex 注释）
+    require(params->struct_size == sizeof(*params),
+            "invalid polygon training ABI structure size");
+    const PolygonShape shape = validate_polygon(*params, width, height);
+    vf_shape_budget_report report = account_training(config_from_polygon(*params, shape),
+                                                     width, height);
+    report.formula_version = 2;
+    const double bbox_area = double(shape.bounds.width) * double(shape.bounds.height);
+    report.polygon_fill_ratio = polygon_mask_area(shape) / bbox_area;
+    return report;
+}
+
 PolygonShape scale_polygon(const PolygonShape& polygon, double factor,
                            int max_width, int max_height) {
     PolygonShape out;
@@ -308,12 +331,39 @@ std::vector<std::vector<cv::Point2d>> unflatten_holes(
 
 uint32_t suggest_contours(const cv::Mat& image, const int32_t* roi_hint,
                           uint32_t max_suggestions, uint32_t max_vertices_per,
+                          const vf_shape_suggest_params* params,
                           vf_shape_vertex* out_vertices, uint32_t* out_vertex_counts) {
     require_coded(max_suggestions >= 1 && max_suggestions <= 256, VF_SHAPE_CAPACITY_INVALID,
                   "max_suggestions must be 1..256", double(max_suggestions), 1.0, 256.0);
     require_coded(max_vertices_per >= 3 && max_vertices_per <= kMaxVertices,
                   VF_SHAPE_CAPACITY_INVALID, "max_vertices_per must be 3..64",
                   double(max_vertices_per), 3.0, double(kMaxVertices));
+    // Canny 阈值与训练 detector 三参同类约束（正且递增的边缘阈值族），同码拒绝
+    constexpr double kDefaultCannyLow = 50.0, kDefaultCannyHigh = 150.0;
+    constexpr double kMinEpsilonFactor = 0.001, kMaxEpsilonFactor = 0.2;
+    double canny_low = kDefaultCannyLow, canny_high = kDefaultCannyHigh;
+    double epsilon_factor = 0.02;
+    if (params) {
+        require(params->struct_size == sizeof(vf_shape_suggest_params),
+                "invalid suggestion params ABI structure size");
+        require_coded(std::isfinite(params->canny_low) && params->canny_low >= 0,
+                      VF_SHAPE_DETECTOR_PARAMS, "suggest canny low threshold must be positive",
+                      params->canny_low);
+        canny_low = params->canny_low > 0 ? params->canny_low : canny_low;
+        require_coded(std::isfinite(params->canny_high) && params->canny_high >= 0,
+                      VF_SHAPE_DETECTOR_PARAMS, "suggest canny high threshold must be positive",
+                      params->canny_high);
+        canny_high = params->canny_high > 0 ? params->canny_high : canny_high;
+        require_coded(canny_high >= canny_low, VF_SHAPE_DETECTOR_PARAMS,
+                      "suggest canny high threshold must not fall below low",
+                      canny_low, canny_high);
+        require_coded(std::isfinite(params->epsilon_factor) &&
+                          (params->epsilon_factor == 0 || (params->epsilon_factor >= kMinEpsilonFactor &&
+                                                           params->epsilon_factor <= kMaxEpsilonFactor)),
+                      VF_SHAPE_DETECTOR_PARAMS, "suggest epsilon factor out of 0.001..0.2",
+                      params->epsilon_factor, kMinEpsilonFactor, kMaxEpsilonFactor);
+        epsilon_factor = params->epsilon_factor > 0 ? params->epsilon_factor : epsilon_factor;
+    }
     cv::Rect search(0, 0, image.cols, image.rows);
     if (roi_hint) {
         require_coded(roi_hint[0] >= 0 && roi_hint[1] >= 0 && roi_hint[2] >= 1 &&
@@ -328,7 +378,7 @@ uint32_t suggest_contours(const cv::Mat& image, const int32_t* roi_hint,
     // 固定 3×3 高斯：闭合斜边阶梯栅格造成的 Canny 断边/回折（确定性不变）
     cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0);
     cv::Mat edges;
-    cv::Canny(gray, edges, 50, 150);
+    cv::Canny(gray, edges, canny_low, canny_high);
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
@@ -340,7 +390,7 @@ uint32_t suggest_contours(const cv::Mat& image, const int32_t* roi_hint,
     for (const auto& contour : contours) {
         const double area = cv::contourArea(contour);
         if (area < kMinHoleArea) continue;
-        double epsilon = std::max(1.0, 0.02 * cv::arcLength(contour, true));
+        double epsilon = std::max(1.0, epsilon_factor * cv::arcLength(contour, true));
         std::vector<cv::Point> approx;
         bool fits = false;
         while (epsilon <= 4.0 * (image.cols + image.rows)) {

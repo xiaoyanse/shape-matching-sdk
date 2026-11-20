@@ -16,11 +16,13 @@ from .native_library import (
     NativeShapeError,
     Polygon,
     PolygonTrainParams,
+    SuggestParams,
     TrainConfig,
     Vertex,
     image_args as _image_args,
     invoke,
     load_library,
+    vertex_array as _vertex_array,
 )
 
 __all__ = [
@@ -28,6 +30,7 @@ __all__ = [
     "NativeModel",
     "NativeShapeError",
     "suggest_contours",
+    "suggest_contours_ex",
     "train_model",
     "train_polygon_model",
 ]
@@ -74,19 +77,12 @@ def _require_polygon(library: ct.CDLL) -> None:
         )
 
 
-def _vertex_array(points) -> ct.Array:
-    """序列 (x, y) → Vertex 数组；轻量校验（几何终审在原生端）。"""
-    items = list(points)
-    if not 3 <= len(items) <= 64:
-        raise NativeShapeError("轮廓顶点数须在 3–64")
-    array = (Vertex * len(items))()
-    for index, point in enumerate(items):
-        x, y = point
-        if not (isinstance(x, (int, float)) and isinstance(y, (int, float))):
-            raise NativeShapeError("顶点坐标须为数值")
-        array[index].x = float(x)
-        array[index].y = float(y)
-    return array
+def _require_ex(library: ct.CDLL) -> None:
+    if not getattr(library, "_ex_exports", False):
+        raise NativeShapeError(
+            "模板匹配原生组件缺少参数化建议导出（suggest_contours_ex，旧运行时），"
+            "请升级制品后使用参数化接口"
+        )
 
 
 def _candidates(output, count: int) -> list[NativeCandidate]:
@@ -376,6 +372,10 @@ def suggest_contours(
                                            len(error))
     if rc < 0:
         raise NativeShapeError(error.value.decode("utf-8", errors="replace"))
+    return _collect_suggestions(rc, vertices, counts)
+
+
+def _collect_suggestions(rc, vertices, counts) -> list[list[tuple[float, float]]]:
     suggestions = []
     offset = 0
     for index in range(rc):
@@ -384,3 +384,49 @@ def suggest_contours(
                             for j in range(count)])
         offset += count
     return suggestions
+
+
+def suggest_contours_ex(
+    frame_bgr: np.ndarray,
+    roi_hint: tuple[int, int, int, int] | None = None,
+    *,
+    max_suggestions: int = 8,
+    max_vertices_per: int = 8,
+    canny_low: float = 0.0,
+    canny_high: float = 0.0,
+    epsilon_factor: float = 0.0,
+) -> list[list[tuple[float, float]]]:
+    """参数化轮廓建议：行为同 suggest_contours，Canny 阈值与逼近精度可调。
+
+    canny_low/canny_high/epsilon_factor 传 0 用原生默认（50/150、0.02×周长）；
+    非零域 canny_low>0、canny_high≥canny_low、epsilon_factor 0.001–0.2，越界
+    原生端按 DETECTOR_PARAMS 拒绝。默认参数下与 suggest_contours 输出逐字节一致。
+    """
+    image_args = _image_args(frame_bgr)
+    library = load_library()
+    _require_polygon(library)
+    _require_ex(library)
+    if not isinstance(max_suggestions, int) or not 1 <= max_suggestions <= 256:
+        raise NativeShapeError("建议条数须为 1–256")
+    if not isinstance(max_vertices_per, int) or not 3 <= max_vertices_per <= 64:
+        raise NativeShapeError("每条建议顶点数须为 3–64")
+    for value in (canny_low, canny_high, epsilon_factor):
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise NativeShapeError("建议参数须为有限数值")
+    hint = None
+    if roi_hint is not None:
+        if len(roi_hint) != 4 or any(not isinstance(v, int) for v in roi_hint):
+            raise NativeShapeError("先验框须为四项整数 xywh")
+        hint = (ct.c_int32 * 4)(*roi_hint)
+    params = SuggestParams(
+        ct.sizeof(SuggestParams), canny_low, canny_high, epsilon_factor
+    )
+    vertices = (Vertex * (max_suggestions * max_vertices_per))()
+    counts = (ct.c_uint32 * max_suggestions)()
+    error = ct.create_string_buffer(2048)
+    rc = library.vf_shape_suggest_contours_ex(*image_args, hint, max_suggestions,
+                                              max_vertices_per, ct.byref(params),
+                                              vertices, counts, error, len(error))
+    if rc < 0:
+        raise NativeShapeError(error.value.decode("utf-8", errors="replace"))
+    return _collect_suggestions(rc, vertices, counts)

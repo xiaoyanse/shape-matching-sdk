@@ -14,10 +14,14 @@ from .native_library import (
     HealthReport,
     MatchTrace,
     NativeShapeError,
+    Polygon,
+    PolygonTrainParams,
     TrainConfig,
+    Vertex,
     image_args as _image_args,
     invoke,
     load_library,
+    vertex_array as _vertex_array,
 )
 
 __all__ = [
@@ -28,6 +32,7 @@ __all__ = [
     "audit_discriminability",
     "error_message",
     "estimate_training",
+    "estimate_training_ex",
     "last_error_info",
     "last_match_info",
     "model_health",
@@ -175,6 +180,10 @@ def estimate_training(
     _require_diagnostics(library)
     invoke(library, "estimate_training", ct.byref(config), image_size[0],
            image_size[1], ct.byref(report))
+    return _budget_dict(report)
+
+
+def _budget_dict(report: BudgetReport) -> dict:
     return {
         "formula_version": report.formula_version,
         "pose_used": report.pose_used,
@@ -187,7 +196,113 @@ def estimate_training(
         "pixel_limit": report.pixel_limit,
         "pixel_over": bool(report.pixel_over),
         "over_budget": report.over_budget,
+        "polygon_fill_ratio": report.polygon_fill_ratio,
     }
+
+
+def _require_ex(library) -> None:
+    if not getattr(library, "_ex_exports", False):
+        raise NativeShapeError(
+            "模板匹配原生组件缺少参数化导出（estimate_training_ex，旧运行时），"
+            "请升级制品后使用预算 v2 接口"
+        )
+
+
+def _polygon_args(outline, holes, *, angle_min, angle_max, angle_step, scale_min,
+                  scale_max, scale_step, weak_th, strong_th, feature_count) -> tuple:
+    """外环/洞序列+训练参数 → (params 结构, 保活存储)；轻量校验（几何终审在原生端）。
+
+    第二个元素是 params 内指针引用的全部 ctypes 数组，调用方须保持其存活
+    到原生调用返回（cast 指针不持引用，悬垂风险自防）。"""
+    outline_array = _vertex_array(outline)
+    hole_arrays = [_vertex_array(hole) for hole in holes]
+    if len(hole_arrays) > 8:
+        raise NativeShapeError("洞数须 ≤8")
+    hole_views = (Polygon * len(hole_arrays))()
+    for index, array in enumerate(hole_arrays):
+        hole_views[index].vertices = ct.cast(array, ct.POINTER(Vertex))
+        hole_views[index].count = len(array)
+    params = PolygonTrainParams(
+        ct.sizeof(PolygonTrainParams),
+        Polygon(ct.cast(outline_array, ct.POINTER(Vertex)), len(outline_array)),
+        hole_views,
+        len(hole_arrays),
+        angle_min,
+        angle_max,
+        angle_step,
+        scale_min,
+        scale_max,
+        scale_step,
+        weak_th,
+        strong_th,
+        feature_count,
+    )
+    return params, [outline_array, hole_views, *hole_arrays]
+
+
+def estimate_training_ex(
+    image_size: tuple[int, int],
+    outline=None,
+    holes=(),
+    *,
+    roi_xywh: tuple[int, int, int, int] | None = None,
+    angle_min: float = 0.0,
+    angle_max: float = 0.0,
+    angle_step: float = 0.0,
+    scale_min: float = 0.0,
+    scale_max: float = 0.0,
+    scale_step: float = 0.0,
+    weak_th: float = 0.0,
+    strong_th: float = 0.0,
+    feature_count: int = 0,
+) -> dict:
+    """多边形训练预算查询（_ex，纯计算）：矩形/多边形两路径共用入口。
+
+    outline=None 走矩形路径（须给 roi_xywh），与 estimate_training 完全一致
+    （formula_version=1、逐字段相等）；outline 给定走多边形路径（roi_xywh 须
+    为 None），与 train_polygon_model 同参语义（角度/缩放/阈值参数即训练实参），
+    返回 formula_version=2 且 polygon_fill_ratio=掩码面积/外接矩形面积
+    （外环−洞面积直减，洞间重叠不消重，建议性提示）；矩形路径该值恒 1.0。
+    """
+    if len(image_size) != 2 or any(not isinstance(v, int) or not 24 <= v <= 4096 for v in image_size):
+        raise NativeShapeError("图像尺寸须为两整数且在 24–4096")
+    params = None
+    if outline is None:
+        if roi_xywh is None:
+            raise NativeShapeError("矩形路径须提供 roi_xywh")
+        if len(roi_xywh) != 4 or any(not isinstance(v, int) or abs(v) > 4096 for v in roi_xywh):
+            raise NativeShapeError("训练 ROI 须为四项整数像素坐标")
+        config = TrainConfig(
+            ct.sizeof(TrainConfig),
+            *roi_xywh,
+            angle_min,
+            angle_max,
+            angle_step,
+            scale_min,
+            scale_max,
+            scale_step,
+            weak_th,
+            strong_th,
+            feature_count,
+        )
+    else:
+        if roi_xywh is not None:
+            raise NativeShapeError("多边形与 roi_xywh 互斥，请只提供其一")
+        params, keepalive = _polygon_args(
+            outline, holes,
+            angle_min=angle_min, angle_max=angle_max, angle_step=angle_step,
+            scale_min=scale_min, scale_max=scale_max, scale_step=scale_step,
+            weak_th=weak_th, strong_th=strong_th, feature_count=feature_count,
+        )
+        config = TrainConfig(ct.sizeof(TrainConfig))
+    report = BudgetReport()
+    report.struct_size = ct.sizeof(BudgetReport)
+    library = load_library()
+    _require_ex(library)
+    invoke(library, "estimate_training_ex", ct.byref(config), image_size[0],
+           image_size[1], ct.byref(params) if params is not None else None,
+           ct.byref(report))
+    return _budget_dict(report)
 
 
 def last_match_info(model) -> dict:

@@ -115,6 +115,7 @@ vf_shape_budget_report account_training(const vf_shape_train_config& c, int widt
     vf_shape_budget_report report{};
     report.struct_size = sizeof(report);
     report.formula_version = 1;
+    report.polygon_fill_ratio = 1.0;  // 矩形核算路径掩码铺满外接矩形
     const auto angles = samples(c.angle_min, c.angle_max, c.angle_step, -180, 180,
                                 VF_SHAPE_INVALID_ANGLE_RANGE);
     const auto scales = samples(c.scale_min, c.scale_max, c.scale_step, .25, 2,

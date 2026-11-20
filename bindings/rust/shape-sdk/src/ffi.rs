@@ -11,9 +11,10 @@ use libloading::os::windows::Library;
 use libloading::Library;
 
 use crate::audit::{AuditDiscriminabilityFn, ModelHealthFn};
-use crate::diagnostics::{EstimateTrainingFn, LastErrorInfoFn, LastMatchInfoFn};
+use crate::diagnostics::{EstimateTrainingExFn, EstimateTrainingFn, LastErrorInfoFn, LastMatchInfoFn};
 use crate::error::ShapeError;
-use crate::polygon::{PolygonMetadataFn, SuggestContoursFn, TrainPolygonFn};
+use crate::polygon::{PolygonMetadataFn, TrainPolygonFn};
+use crate::suggest::{SuggestContoursExFn, SuggestContoursFn};
 
 /// 原生入口错误缓冲容量（对齐 Python 绑定的 2048 字节）
 const ERROR_CAPACITY: usize = 2048;
@@ -147,7 +148,7 @@ type MatchBatchFn = unsafe extern "C" fn(
     u32,
 ) -> i32;
 
-/// 已解析的原生 ABI：库句柄与 11 个入口的函数指针同寿命共存于本结构，
+/// 已解析的原生 ABI：库句柄与全部入口的函数指针同寿命共存于本结构，
 /// 调用仅经由本结构方法进行（库存活期间指针有效，不存在自引用失效问题）。
 pub(crate) struct NativeAbi {
     #[allow(dead_code)] // 字段本身承载库寿命；Drop 由它负责
@@ -169,6 +170,9 @@ pub(crate) struct NativeAbi {
     pub(crate) train_polygon_fn: Option<TrainPolygonFn>,
     pub(crate) suggest_contours_fn: Option<SuggestContoursFn>,
     pub(crate) polygon_metadata_fn: Option<PolygonMetadataFn>,
+    // P2/P3 参数化与预算 v2 导出同为加性：缺失容忍，调用处报错
+    pub(crate) suggest_contours_ex_fn: Option<SuggestContoursExFn>,
+    pub(crate) estimate_ex_fn: Option<EstimateTrainingExFn>,
     // 体检/审计两导出同为加性（批2b）：缺失容忍，体检/审计 API 调用处报错
     pub(crate) model_health_fn: Option<ModelHealthFn>,
     pub(crate) audit_fn: Option<AuditDiscriminabilityFn>,
@@ -197,7 +201,7 @@ fn load_library(path: &Path) -> Result<Library, libloading::Error> {
 }
 
 impl NativeAbi {
-    /// 装载动态库并解析全部 8 个符号；缺失任一即失败
+    /// 装载动态库：核心符号缺失即失败，加性导出缺失容忍（置空指针）
     pub(crate) fn open(path: &Path) -> Result<Self, ShapeError> {
         // SAFETY: 装载外部库会执行其初始化代码；路径来自本 crate 的运行时发现
         // 且经 manifest 哈希校验。函数指针从 Symbol 解引用拷贝后仅随本结构调用，
@@ -248,6 +252,14 @@ impl NativeAbi {
                     .map(|s| *s),
                 polygon_metadata_fn: library
                     .get(b"vf_shape_polygon_metadata\0")
+                    .ok()
+                    .map(|s| *s),
+                suggest_contours_ex_fn: library
+                    .get(b"vf_shape_suggest_contours_ex\0")
+                    .ok()
+                    .map(|s| *s),
+                estimate_ex_fn: library
+                    .get(b"vf_shape_estimate_training_ex\0")
                     .ok()
                     .map(|s| *s),
                 model_health_fn: library.get(b"vf_shape_model_health\0").ok().map(|s| *s),

@@ -102,12 +102,53 @@ Rust 绑定同构：`train_polygon_model` / `suggest_contours` / `Model::polygon
   [细分类型, 主参数, 次参数]（细分类型含义见头文件枚举注释）
 - **`vf_shape_suggest_contours` 返回值语义特殊**：≥0 为建议条数（0=无建议，
   非错误），-1=可报告失败，-2=未分类原生失败
+- **参数化建议（`vf_shape_suggest_contours_ex`，加性导出）**：Canny 阈值
+  （canny_low/canny_high，0=默认 50/150）与逼近精度（epsilon_factor，0=默认
+  0.02×周长，域 0.001–0.2）可调；params=NULL 时与 v1 逐字节一致。阈值语义与
+  训练 detector 三参同类（正且递增的边缘阈值族），越界按
+  `VF_SHAPE_DETECTOR_PARAMS(8)` 带码拒绝。低阈值可提取弱边缘轮廓，小 epsilon
+  提高顶点密度（顶点数仍受 max_vertices_per 约束，逼近循环会加粗 epsilon
+  直到顶点入限）。Python `suggest_contours_ex` / Rust `SuggestParams` +
+  `suggest_contours_ex`
 - **容器兼容承诺**：多边形资产容器 meta 段携带可选 `poly` 键（归一化外环顶点+
   洞分段+外接矩形）；**旧版本库加载多边形容器=合法**（忽略 poly 键、按外接矩形
   回退解读，几何回读为外接矩形近似）；新版本库加载旧容器（无 poly 键）=矩形
   语义不变；poly 键几何非法或与 cfg.roi 不一致按 MODEL_TAMPER/INVALID_POLYGON 拒绝
 - **耗时承诺**：1080P 参考图 + 35 位姿、外接矩形 ≤400px 的多边形训练 ≤2s
   （实测基线见 tests/polygon_test.cpp 耗时背书用例）
+
+### 多边形预算查询（`vf_shape_estimate_training_ex`，加性导出）
+
+训练前无副作用预查多边形训练账本，params=NULL 时与矩形 `estimate_training`
+完全一致（formula_version=1、逐字段相等）；给定 outline/holes 时与
+`train_polygon_model` 同参语义（角度/缩放/阈值即训练实参），formula_version=2
+并新增 `polygon_fill_ratio`（掩码面积/外接矩形面积比，外环−洞面积直减、洞间
+重叠不消重，建议性密度提示；矩形路径恒 1.0）。
+
+```python
+from shape_sdk import estimate_training_ex
+
+# 矩形路径（与 estimate_training 逐字段一致，formula_version=1）
+estimate_training_ex((480, 480), roi_xywh=(90, 90, 220, 220),
+                     angle_min=-30, angle_max=30, angle_step=15,
+                     scale_min=1.0, scale_max=1.0, scale_step=1.0)
+# 多边形路径（formula_version=2 + polygon_fill_ratio）
+estimate_training_ex((480, 480), [(90, 90), (310, 90), (310, 310), (90, 310)],
+                     angle_min=-30, angle_max=30, angle_step=15,
+                     scale_min=1.0, scale_max=1.0, scale_step=1.0)
+```
+
+Rust 绑定同构：`ShapeLibrary::estimate_training_ex(w, h, TrainingShape::…)`，
+`TrainingShape::Rect(&TrainParams)` / `TrainingShape::Polygon(&PolygonTrainParams)`。
+
+- **账本合同**：多边形路径与其外接矩形路径同式同序（pose/canvas/pixel 三账本
+  逐字段一致，外接矩形即 ROI）；版本演进规则=尾部加性追加 + formula_version
+  递增，既有字段偏移永不变化
+- **struct_size 兼容**：`vf_shape_budget_report` v1（追加前，64 字节）与 v2
+  （追加后，72 字节）两种布局均接受，库按调用方 struct_size 只回写前缀字段；
+  formula_version=1 时 polygon_fill_ratio 不构成消费承诺
+- **错误码**：几何非法复用 `INVALID_POLYGON(17)` 细分；角度/缩放域沿用
+  INVALID_ANGLE_RANGE/INVALID_SCALE_RANGE
 
 ## 模板健康体检与区分度审计（ABI v3 加性导出）
 
@@ -192,6 +233,9 @@ Rust 绑定同构：`Model::health()` / `Model::audit_discriminability(&pos, &ne
   `-BuildTests` 在装配完成后自动执行，为构建门禁一部分（需 python + numpy）
 - `scripts/test_polygon_chain.py`：Python 绑定多边形合同回归（多边形训练→元数据
   往返→容器 poly 方言→suggest_contours，需 python + numpy）
+- `scripts/test_p23_chain.py` + `bindings/rust/shape-sdk/tests/p23.rs`：参数化建议
+  与多边形预算合同回归（suggest_contours_ex 默认一致性/阈值/epsilon/拒绝码 +
+  estimate_training_ex 账本同式同序/formula_version/fill ratio 手算对照）
 - `scripts/smoke_binding.py`：绑定加载冒烟（manifest 校验 + ABI 协商）
 - `bindings/rust/shape-sdk/tests/`：Rust 绑定回归（smoke + abi_chain 五组核心断言，
   对齐 `scripts/test_main_chain.py` 与 `tests/abi_chain_test.cpp`）+ `conformance.rs`
