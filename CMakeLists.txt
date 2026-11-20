@@ -22,7 +22,8 @@ if(VF_SHAPE_CUDA)
 endif()
 set(VF_GPU_SOURCES)
 if(VF_SHAPE_CUDA)
-    list(APPEND VF_GPU_SOURCES src/gpu/gpu_device.cu src/gpu/gpu_backend.cpp)
+    list(APPEND VF_GPU_SOURCES src/gpu/gpu_device.cu src/gpu/coarse_kernels.cu
+        src/gpu/gpu_backend.cpp)
 endif()
 add_library(visionforge_shape SHARED
     src/abi.cpp src/model_codec.cpp src/matcher.cpp src/polygon.cpp src/two_stage.cpp
@@ -191,5 +192,26 @@ if(VF_SHAPE_BUILD_TESTS)
         add_test(NAME shape_gpu_residency COMMAND shape_gpu_residency_test)
         list(APPEND VF_TEST_NAMES shape_gpu_residency)
     endif()
+    # W2 Phase A 粗层三核对拍（独立于引擎接缝）：fastAtan2 复刻穷举 + GPU 内核
+    # 对 CPU 参考双模逐位（Spike 基线/Vendor 复刻口径）。OFF 构建编译跳行 main
+    # 返回 77，ctest 报 Skipped 而非缺席（防假绿：无 CUDA 不等于测试通过）；
+    # 无卡环境 device_info 失败/算力集外同样 77。
+    add_executable(shape_gpu_bitexact_test tests/gpu_bitexact_test.cpp
+        tests/gpu_coarse_reference.cpp)
+    target_include_directories(shape_gpu_bitexact_test PRIVATE include src
+        ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(shape_gpu_bitexact_test PRIVATE ${OpenCV_LIBS} Threads::Threads)
+    if(MSVC)
+        target_compile_options(shape_gpu_bitexact_test PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+    endif()
+    if(VF_SHAPE_CUDA)
+        target_sources(shape_gpu_bitexact_test PRIVATE src/gpu/gpu_device.cu
+            src/gpu/coarse_kernels.cu)
+        target_compile_definitions(shape_gpu_bitexact_test PRIVATE VF_SHAPE_CUDA=1)
+    endif()
+    add_test(NAME shape_gpu_bitexact COMMAND shape_gpu_bitexact_test)
+    list(APPEND VF_TEST_NAMES shape_gpu_bitexact)
     set_tests_properties(${VF_TEST_NAMES} PROPERTIES ENVIRONMENT "${VF_TEST_ENV}")
+    set_tests_properties(shape_gpu_bitexact PROPERTIES SKIP_RETURN_CODE 77)
 endif()

@@ -1,8 +1,9 @@
-// GPU 设备面实现（W1）：CUDA 上下文/POD 驻留/帧上传/LUT 驻留，无匹配内核
-//（W2 引入）。本文件不 include 引擎头（model.hpp/OpenCV/vendor），nvcc 编译
-// 坑面最小。纪律（尖峰 README 环境坑表）：nvcc 前端按系统代码页词法分析 .cu
-// 字符串字面量——本文件字面量一律 ASCII，中文仅出现在注释。
+// GPU 设备面实现（W1 骨架 + W2 模板尺寸驻留）：CUDA 上下文/POD 驻留/帧上传/LUT
+// 驻留；匹配内核在 coarse_kernels.cu。本文件不 include 引擎头（model.hpp/OpenCV/
+// vendor），nvcc 编译坑面最小。纪律（尖峰 README 环境坑表）：nvcc 前端按系统代码
+// 页词法分析 .cu 字符串字面量——本文件字面量一律 ASCII，中文仅出现在注释。
 #include "gpu_device.hpp"
+#include "gpu_context.hpp"
 #include "similarity_lut.h"
 
 #include <cuda_runtime.h>
@@ -18,19 +19,6 @@ namespace {
 // SIMILARITY_LUT 经 similarity_lut.h 以 __constant__ 引入（__CUDACC__ 分支），
 // 全设备可见；模块加载即带初始映像，lut_upload 仍显式上传以钉住同源口径
 
-struct LevelBuffers {
-    uint8_t *bgr = nullptr, *smooth = nullptr;
-    uint32_t* blur_tmp = nullptr;
-    uint8_t *bucket = nullptr, *angle = nullptr, *spread = nullptr, *spread_h = nullptr;
-    float* mag = nullptr;
-    int w = 0, h = 0;
-};
-
-// 设备侧特征记录（尖峰 int4 布局：x/y/label/pad）
-struct Feature4 {
-    int32_t x = 0, y = 0, label = 0, pad = 0;
-};
-
 #define CUDA_CHECK(call)                                                           \
     do {                                                                           \
         const cudaError_t status = (call);                                         \
@@ -41,21 +29,6 @@ struct Feature4 {
     } while (0)
 
 }  // namespace
-
-struct GpuContext {
-    LevelBuffers level[2];  // [0]=L0 全分辨率档，[1]=L1 半分辨率档
-    Feature4* feats = nullptr;
-    int *feat_begin = nullptr, *feat_count = nullptr;  // 前半 L1、后半 L0（尖峰布局）
-    uint16_t* response = nullptr;
-    int4* centers = nullptr;
-    uint16_t* window_scores = nullptr;
-    size_t response_capacity = 0;
-    int pose_capacity = 0;
-    int feat_capacity = 0;
-    int resident_poses = 0;
-    int resident_feats = 0;
-    bool features_ready = false;
-};
 
 GpuContext* create_context(int max_w, int max_h, int max_poses, int max_feats,
                            int max_candidates, int max_positions, std::string& err) {
@@ -93,6 +66,7 @@ GpuContext* create_context(int max_w, int max_h, int max_poses, int max_feats,
     if (cudaMalloc(&ctx->feats, sizeof(Feature4) * max_feats) != cudaSuccess ||
         cudaMalloc(&ctx->feat_begin, sizeof(int) * max_poses * 2) != cudaSuccess ||
         cudaMalloc(&ctx->feat_count, sizeof(int) * max_poses * 2) != cudaSuccess ||
+        cudaMalloc(&ctx->templ_dims, sizeof(int2) * max_poses * 2) != cudaSuccess ||
         cudaMalloc(&ctx->response, sizeof(uint16_t) * ctx->response_capacity) != cudaSuccess ||
         cudaMalloc(&ctx->centers, sizeof(int4) * max_candidates) != cudaSuccess ||
         cudaMalloc(&ctx->window_scores, sizeof(uint16_t) * 256 * max_candidates) !=
@@ -119,6 +93,7 @@ void destroy_context(GpuContext* ctx) {
     cudaFree(ctx->feats);
     cudaFree(ctx->feat_begin);
     cudaFree(ctx->feat_count);
+    cudaFree(ctx->templ_dims);
     cudaFree(ctx->response);
     cudaFree(ctx->centers);
     cudaFree(ctx->window_scores);
@@ -184,6 +159,38 @@ bool readback_features(const GpuContext* ctx, std::vector<FeatureRecord>& feats,
                           cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(count.data(), ctx->feat_count, sizeof(int) * count.size(),
                           cudaMemcpyDeviceToHost));
+    return true;
+}
+
+bool upload_template_dims(GpuContext* ctx, const int* widths, const int* heights, int len,
+                          std::string& err) {
+    if (!ctx) {
+        err = "null context";
+        return false;
+    }
+    if (!widths || !heights) {
+        err = "null dims arrays";
+        return false;
+    }
+    if (len != ctx->pose_capacity * 2) {
+        err = "template dims length mismatch";
+        return false;
+    }
+    // 每位姿每层模板 (width,height)，slot 布局与 feat_begin/feat_count 同式
+    //（前半 L1 slot=id、后半 L0 slot=pose_capacity+id）——vendor similarity 的
+    // span 边界与线性内存回卷语义依赖模板宽高（wf/hf），W2 粗层内核驻留此表
+    std::vector<int2> packed;
+    packed.resize(size_t(len));
+    for (int i = 0; i < len; ++i) {
+        if (widths[i] <= 0 || heights[i] <= 0) {
+            err = "template dims must be positive";
+            return false;
+        }
+        packed[size_t(i)] = make_int2(widths[i], heights[i]);
+    }
+    CUDA_CHECK(cudaMemcpy(ctx->templ_dims, packed.data(), sizeof(int2) * size_t(len),
+                          cudaMemcpyHostToDevice));
+    ctx->dims_ready = true;
     return true;
 }
 

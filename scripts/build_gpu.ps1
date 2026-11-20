@@ -6,11 +6,13 @@ param(
     [string]$CMakePath = 'cmake.exe',
     [string]$NinjaPath = 'ninja.exe',
     [ValidateSet('on', 'off', 'both')]
-    [string]$Mode = 'both'
+    [string]$Mode = 'both',
+    # 构建目录名（build\ 下；OFF 目录后缀 -off）。W1 默认 gpuw1，W2A 用 gpuw2a
+    [string]$BuildName = 'gpuw1'
 )
-# GPU W1 双模式构建（规划 .artifacts/proposals/gpu-port-phase0.md）：
-#   ON  -> build/gpuw1      （VF_SHAPE_CUDA=ON，三代 fatbin + 静态 cudart + GPU 冒烟）
-#   OFF -> build/gpuw1-off  （VF_SHAPE_CUDA=OFF，纯 CPU 对照，产物与现状等价）
+# GPU 双模式构建（规划 .artifacts/proposals/gpu-port-phase0.md；-BuildName 选目录）：
+#   ON  -> build/<name>      （VF_SHAPE_CUDA=ON，三代 fatbin + 静态 cudart + GPU 测试）
+#   OFF -> build/<name>-off  （VF_SHAPE_CUDA=OFF，纯 CPU 对照，产物与现状等价）
 # 不装配 dist/runtime（独立构建目录，不碰根装配产物）。
 #
 # 构建坑表（源出 benchmarks/gpu-spike README"环境坑"，在此固化）：
@@ -75,8 +77,8 @@ function Invoke-Build([string]$buildDir, [string]$cudaOption) {
 }
 
 if ($Mode -in @('on', 'both')) {
-    Invoke-Build (Join-Path $repoRoot 'build\gpuw1') 'ON'
+    Invoke-Build (Join-Path $repoRoot "build\$BuildName") 'ON'
 }
 if ($Mode -in @('off', 'both')) {
-    Invoke-Build (Join-Path $repoRoot 'build\gpuw1-off') 'OFF'
+    Invoke-Build (Join-Path $repoRoot "build\$BuildName-off") 'OFF'
 }

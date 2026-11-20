@@ -25,8 +25,9 @@ bool device_info(std::string& name, int& major, int& minor, std::string& err);
 int context_pose_capacity(const GpuContext* ctx);
 
 // 创建/销毁。容量口径同尖峰：max_w/max_h 为 L0 帧档（L1 自动减半），
-// max_feats 为两层特征总数上限，max_candidates/max_positions 为精修窗/
-// 响应图容量（W2/W3 内核工作面，缓冲随骨架一次分配）。
+// max_feats 为两层特征总数上限，max_candidates 为精修窗容量（W3），
+// max_positions 为单 pose 响应格数容量——W2 粗层按 L0 全图口径
+//（(max_w/4)*(max_h/4)，L1 复用同一缓冲前缀）。
 GpuContext* create_context(int max_w, int max_h, int max_poses, int max_feats,
                            int max_candidates, int max_positions, std::string& err);
 void destroy_context(GpuContext* ctx);
@@ -36,6 +37,12 @@ void destroy_context(GpuContext* ctx);
 bool upload_features(GpuContext* ctx, const FeatureRecord* feats, int feat_total,
                      const int* begin, const int* count, int layout_len, int poses,
                      std::string& err);
+
+// 模板尺寸驻留（W2）：每 pose 每层模板 (width,height)，slot 布局同 begin/count
+//（长度 2*pose_capacity）。vendor 相似度的 span 写入边界（wf/hf）与线性内存
+// 出界回卷语义依赖模板宽高——粗层内核 run_coarse_chain 前置要求已驻留。
+bool upload_template_dims(GpuContext* ctx, const int* widths, const int* heights, int len,
+                          std::string& err);
 
 // 特征驻留回读（一致性断言/诊断）：feats 为驻留量条数，begin/count 为容量
 // 布局（2*pose_capacity 项，驻留 slot 外的值未定义）。

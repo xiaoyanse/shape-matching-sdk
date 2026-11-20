@@ -25,10 +25,12 @@ bool upload_model_features(GpuContext* ctx, const Model& model, std::string& err
         return false;
     }
     std::vector<FeatureRecord> feats;
-    std::vector<int> begin, count;
+    std::vector<int> begin, count, widths, heights;
     int total_l1 = 0, total_l0 = 0;
     begin.assign(size_t(capacity) * 2, 0);
     count.assign(size_t(capacity) * 2, 0);
+    widths.assign(size_t(capacity) * 2, 1);
+    heights.assign(size_t(capacity) * 2, 1);
     for (int level = 1; level >= 0; --level) {  // 先 L1 后 L0 拼接（尖峰布局）
         for (int id = 0; id < n; ++id) {
             const auto& pyramid = model.detector.getTemplates("shape", id);
@@ -40,12 +42,16 @@ bool upload_model_features(GpuContext* ctx, const Model& model, std::string& err
             const int slot = level == 1 ? id : capacity + id;
             begin[size_t(slot)] = int(feats.size());
             count[size_t(slot)] = int(features.size());
+            widths[size_t(slot)] = pyramid[size_t(level)].width;
+            heights[size_t(slot)] = pyramid[size_t(level)].height;
             for (const auto& f : features) feats.push_back({f.x, f.y, f.label});
             (level ? total_l1 : total_l0) += int(features.size());
         }
     }
     if (!upload_features(ctx, feats.data(), int(feats.size()), begin.data(), count.data(),
                          int(begin.size()), n, err))
+        return false;
+    if (!upload_template_dims(ctx, widths.data(), heights.data(), int(widths.size()), err))
         return false;
     if (stats) {
         stats->pose_count = n;
