@@ -2,6 +2,8 @@
 // 最近匹配诊断 trace。链接真实 SDK 库，共享支撑复用 abi_chain_support.h。
 #include "abi_chain_support.h"
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -163,6 +165,31 @@ void group_budget_boundary() {
     check(abi_rc == 1, "struct_size 未置应拒绝");
 }
 
+void expect_legacy_trace(uint64_t handle, const vf_shape_match_trace& trace) {
+    constexpr uint32_t legacy_size = 112;
+    constexpr unsigned char sentinel = 0xAB;
+    struct {
+        vf_shape_match_trace trace;
+        std::array<unsigned char, 16> guard;
+    } buffer{};
+    std::memset(&buffer, sentinel, sizeof(buffer));
+    buffer.trace.struct_size = legacy_size;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&buffer);
+    const auto* expected = reinterpret_cast<const unsigned char*>(&trace);
+    constexpr auto size_field = sizeof(buffer.trace.struct_size);
+    for (int attempt = 1; attempt <= 2; ++attempt) {
+        const int32_t rc = vf_shape_last_match_info(handle, &buffer.trace, g_error, sizeof(g_error));
+        const std::string label = "v1 trace 调用 " + std::to_string(attempt);
+        check(rc == 0, label + " 失败：" + g_error);
+        check(buffer.trace.struct_size == legacy_size, label + " 未回显原始声明尺寸");
+        check(std::memcmp(bytes + size_field, expected + size_field, legacy_size - size_field) == 0,
+              label + " 前缀字段与 v2 快照不一致");
+        check(std::all_of(bytes + legacy_size, bytes + sizeof(buffer),
+                          [sentinel](unsigned char byte) { return byte == sentinel; }),
+              label + " 改写了声明范围外的尾哨兵");
+    }
+}
+
 void group_match_trace() {
     const cv::Mat ref = synth_reference();
     const auto config = make_config({32, 32, 176, 176}, 0, 0, 1, 1, 1, 1, 20, 40, 32);
@@ -198,6 +225,10 @@ void group_match_trace() {
     rc = vf_shape_last_match_info(trained.handle, &again, g_error, sizeof(g_error));
     check(rc == 0 && std::memcmp(&trace, &again, sizeof(trace)) == 0,
           "二次 trace 查询应得同一快照");
+    for (double score : trace.window_collect_best_scores)
+        check(score == 0.0, "清洁命中未尝试救分，v2 各窗收集分应为 0");
+    check(trace.rescued_candidates == 0, "清洁命中未尝试救分，v2 救活候选数应为 0");
+    expect_legacy_trace(trained.handle, trace);
     // 单级模型：仅 final_candidates 有效
     const auto ranged = make_config({32, 32, 176, 176}, -20, 20, 8, 0.8, 1.2, 0.2);
     HandleGuard two_level{train_handle(ref, ranged, "单级来源")};

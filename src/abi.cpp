@@ -49,12 +49,16 @@ int32_t boundary(char* error, uint32_t capacity, Function&& body) noexcept {
 }
 
 // 诊断快照落句柄档案（单级无两级编排：仅最终候选数有效，其余恒 0）
+// 诊断快照落句柄档案（单级无两级编排：仅最终候选数有效，其余恒 0）
 void store_two_stage_trace(ModelHolder& holder, const vfshape::MatchTraceSnapshot& snap) {
     holder.last_trace.struct_size = sizeof(vf_shape_match_trace);
     holder.last_trace.coarse_candidates = uint32_t(std::max(0, snap.coarse_candidates));
     holder.last_trace.windows_searched = uint32_t(std::max(0, snap.windows_searched));
     holder.last_trace.final_candidates = uint32_t(std::max(0, snap.final_candidates));
     std::copy_n(snap.window_best.begin(), 8, holder.last_trace.window_best_scores);
+    std::copy_n(snap.window_collect_best.begin(), 8,
+                holder.last_trace.window_collect_best_scores);
+    holder.last_trace.rescued_candidates = snap.rescued_candidates;
     holder.last_trace.coarse_ms = snap.coarse_ms;
     holder.last_trace.coarse_resize_ms = snap.coarse_resize_ms;
     holder.last_trace.windows_ms = snap.windows_ms;
@@ -427,14 +431,24 @@ int32_t vf_shape_polygon_metadata(uint64_t handle, vf_shape_vertex* outline, uin
         }
     });
 }
+// 匹配 trace v1 布局尺寸（window_collect_best_scores/rescued_candidates 尾部
+// 追加前）：旧消费方仍传 112；入口按 struct_size 判别，只回写声明长度的前缀
+constexpr uint32_t kMatchTraceV1Size = 112;
+static_assert(sizeof(vf_shape_match_trace) == kMatchTraceV1Size + sizeof(double) * 8 + 8,
+              "match trace v2 layout drifted");
+
 int32_t vf_shape_last_match_info(uint64_t handle, vf_shape_match_trace* out,
     char* error, uint32_t capacity) {
     return boundary(error, capacity, [&] {
         vfshape::require(out, "missing match trace output");
-        vfshape::require(out->struct_size == sizeof(*out), "invalid match trace output ABI");
+        uint32_t declared_size = 0;
+        std::memcpy(&declared_size, out, sizeof(declared_size));
+        vfshape::require(declared_size == sizeof(*out) || declared_size == kMatchTraceV1Size,
+                         "invalid match trace output ABI");
         auto model = get(handle);
         std::lock_guard<std::mutex> lock(model->mutex);
-        *out = model->last_trace;
+        std::memcpy(out, &model->last_trace, declared_size);
+        std::memcpy(out, &declared_size, sizeof(declared_size));
     });
 }
 int32_t vf_shape_model_health(uint64_t handle, vf_shape_health_report* out,

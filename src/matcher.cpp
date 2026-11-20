@@ -297,31 +297,31 @@ void validate_search_budget(const Model& model, int width, int height) {
                   double(used), 4000000.0);
 }
 
-PreparedFrame prepare_frame(const cv::Mat& image, const Detector* detector) {
+cv::Mat pad_for_detector(const cv::Mat& image) {
     // Borders permit partial edge targets and satisfy upstream pyramid alignment.
     constexpr int padding = PreparedFrame::padding;
     const int width = (image.cols + padding * 2 + 15) / 16 * 16;
     const int height = (image.rows + padding * 2 + 15) / 16 * 16;
     cv::Mat padded(height, width, CV_8UC3, cv::Scalar::all(0));
     image.copyTo(padded(cv::Rect(padding, padding, image.cols, image.rows)));
+    return padded;
+}
+
+PreparedFrame prepare_frame(const cv::Mat& image, const Detector* detector) {
+    const int width = (image.cols + PreparedFrame::padding * 2 + 15) / 16 * 16;
+    const int height = (image.rows + PreparedFrame::padding * 2 + 15) / 16 * 16;
     Detector fallback;  // 无模型上下文时用默认参（训练前的独立帧准备）
     const Detector& d = detector ? *detector : fallback;
-    return {d.prepareOwned(std::move(padded)), image.cols, image.rows, width, height};
+    return {d.prepareOwned(pad_for_detector(image)), image.cols, image.rows, width, height};
 }
 
 // 姿态歧义分数差豁免阈（0-100 相似度）：簇内姿态差超限的两解分差 ≥ 此值时
 // 高分解明显领先，豁免歧义；分差小于此值才是无法分辨的多姿态解
 constexpr double kAmbiguityScoreGap = 10.;
 
-std::vector<vf_shape_candidate> match_prepared(Model& model, const PreparedFrame& frame, double threshold) {
-    require_coded(std::isfinite(threshold) && threshold > 0 && threshold <= 100,
-                  VF_SHAPE_THRESHOLD_INVALID, "invalid similarity threshold", threshold);
-    const auto blocks = uint64_t(frame.padded_width / 16) * (frame.padded_height / 16) * model.poses.size();
-    require_coded(blocks <= 4000000, VF_SHAPE_SEARCH_BUDGET, "matching search budget exceeded",
-                  double(blocks), 4000000.0);
-    auto hits = model.detector.matchPrepared(frame.features, float(threshold), {"shape"});
-    require_coded(hits.size() <= 200000, VF_SHAPE_SEARCH_BUDGET, "candidate budget exceeded",
-                  double(hits.size()), 200000.0);
+std::vector<vf_shape_candidate> collect_hit_objects(Model& model,
+                                                    const std::vector<line2Dup::Match>& hits,
+                                                    const PreparedFrame& frame) {
     std::vector<vf_shape_candidate> objects;
     uint64_t comparisons = 0;
     for (const auto& hit : hits) {
@@ -352,5 +352,17 @@ std::vector<vf_shape_candidate> match_prepared(Model& model, const PreparedFrame
         if (!merged) objects.push_back(current);
     }
     return objects;
+}
+
+std::vector<vf_shape_candidate> match_prepared(Model& model, const PreparedFrame& frame, double threshold) {
+    require_coded(std::isfinite(threshold) && threshold > 0 && threshold <= 100,
+                  VF_SHAPE_THRESHOLD_INVALID, "invalid similarity threshold", threshold);
+    const auto blocks = uint64_t(frame.padded_width / 16) * (frame.padded_height / 16) * model.poses.size();
+    require_coded(blocks <= 4000000, VF_SHAPE_SEARCH_BUDGET, "matching search budget exceeded",
+                  double(blocks), 4000000.0);
+    auto hits = model.detector.matchPrepared(frame.features, float(threshold), {"shape"});
+    require_coded(hits.size() <= 200000, VF_SHAPE_SEARCH_BUDGET, "candidate budget exceeded",
+                  double(hits.size()), 200000.0);
+    return collect_hit_objects(model, hits, frame);
 }
 }

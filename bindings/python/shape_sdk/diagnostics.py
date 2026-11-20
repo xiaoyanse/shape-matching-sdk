@@ -306,14 +306,27 @@ def estimate_training_ex(
 
 
 def last_match_info(model) -> dict:
-    """句柄最近一次 match/match_batch 的诊断快照（单级模型仅 final_candidates 有效）。"""
+    """句柄最近一次 match/match_batch 的诊断快照（单级模型仅 final_candidates 有效）。
+
+    112 字节的旧运行时不返回 window_collect_best_scores 和 rescued_candidates。
+    """
     with model._lock:
         model._require_open()
-        _require_diagnostics(model._library)
-        trace = MatchTrace()
-        trace.struct_size = ct.sizeof(MatchTrace)
-        invoke(model._library, "last_match_info", model._handle, ct.byref(trace))
-        return {
+        library = model._library
+        _require_diagnostics(library)
+        legacy_size = 112
+        legacy = getattr(library, "_match_trace_v1", False)
+        trace = MatchTrace(struct_size=legacy_size if legacy else ct.sizeof(MatchTrace))
+        try:
+            invoke(library, "last_match_info", model._handle, ct.byref(trace))
+        except NativeShapeError as exc:
+            if legacy or exc.args != ("invalid match trace output ABI",):
+                raise
+            trace = MatchTrace(struct_size=legacy_size)
+            invoke(library, "last_match_info", model._handle, ct.byref(trace))
+            # Once confirmed, avoid recording another expected native failure on each read.
+            library._match_trace_v1 = legacy = True
+        result = {
             "coarse_candidates": trace.coarse_candidates,
             "windows_searched": trace.windows_searched,
             "final_candidates": trace.final_candidates,
@@ -323,6 +336,10 @@ def last_match_info(model) -> dict:
             "windows_ms": trace.windows_ms,
             "finish_ms": trace.finish_ms,
         }
+        if not legacy:
+            result["window_collect_best_scores"] = tuple(trace.window_collect_best_scores)
+            result["rescued_candidates"] = trace.rescued_candidates
+        return result
 
 
 HEALTH_VERDICTS = {"HEALTHY": 0, "DEGRADED": 1, "WEAK": 2}

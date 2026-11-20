@@ -229,14 +229,20 @@ typedef struct {
  *   容量截断前）。计数常开、零开销。
  * coarse_ms/coarse_resize_ms/windows_ms/finish_ms：分阶段耗时（毫秒），
  *   仅诊断计时构建（VF_SHAPE_PROFILE_STAGES）填充，常规构建恒为 0。
+ * window_collect_best_scores（v2 尾部追加）：仅记录实际执行救分收集的窗口，
+ *   值为重整前最高原始分。未尝试救分的窗填 0（不是实测低分）；尝试后无候选也为 0。
+ * rescued_candidates（v2）：实际救分中低于判定阈且重整后过阈的候选数；未尝试为 0。
  * 单级模型无两级编排：仅 final_candidates 有效，其余为 0。句柄尚未执行
  * 过匹配时全部字段为 0（struct_size 回显除外）。
+ * struct_size 兼容 v1（追加前 112 字节，库只回写前缀字段）与 v2 两种布局。
  */
 typedef struct {
     uint32_t struct_size;
     uint32_t coarse_candidates, windows_searched, final_candidates;
     double window_best_scores[8];
     double coarse_ms, coarse_resize_ms, windows_ms, finish_ms;
+    double window_collect_best_scores[8];
+    int32_t rescued_candidates;
 } vf_shape_match_trace;
 
 /* 模型体检结论分级（vf_shape_model_health 输出 verdict），取更重原则：
@@ -451,8 +457,8 @@ VF_SHAPE_API int32_t vf_shape_polygon_metadata(uint64_t handle,
     uint32_t* hole_count, char* error, uint32_t error_capacity);
 
 /* 查询句柄最近一次 match/match_batch 的诊断快照。非阻塞快照：句柄锁下
- * 读取，与在途匹配串行。out->struct_size 须先置为 sizeof，返回后库按其
- * 回显。返回码分层同文件头。 */
+ * 读取，与在途匹配串行。out->struct_size 须先置为 sizeof（v2）或 v1 布局
+ * 尺寸 112，库按其只回写对应前缀。返回码分层同文件头。 */
 VF_SHAPE_API int32_t vf_shape_last_match_info(uint64_t handle,
     vf_shape_match_trace* out, char* error, uint32_t error_capacity);
 

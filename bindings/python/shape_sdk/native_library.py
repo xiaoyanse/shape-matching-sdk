@@ -107,6 +107,11 @@ class BudgetReport(ct.Structure):
 
 
 class MatchTrace(ct.Structure):
+    """vf_shape_match_trace（v2 布局，尾部含收集带诊断）。
+
+    原生端兼容 v1（追加前 112 字节）与 v2 两种 struct_size；对旧运行时
+    v2 结构会被拒绝（与 BudgetReport v2 同款前例），诊断属加性能力。"""
+
     _fields_ = [
         ("struct_size", ct.c_uint32),
         ("coarse_candidates", ct.c_uint32),
@@ -117,6 +122,8 @@ class MatchTrace(ct.Structure):
         ("coarse_resize_ms", ct.c_double),
         ("windows_ms", ct.c_double),
         ("finish_ms", ct.c_double),
+        ("window_collect_best_scores", ct.c_double * 8),
+        ("rescued_candidates", ct.c_int32),
     ]
 
 

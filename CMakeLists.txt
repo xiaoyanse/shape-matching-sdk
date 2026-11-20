@@ -27,7 +27,8 @@ endif()
 add_library(visionforge_shape SHARED
     src/abi.cpp src/model_codec.cpp src/matcher.cpp src/polygon.cpp src/two_stage.cpp
     src/two_stage_train.cpp src/container_codec.cpp src/geometric_refinement.cpp
-    src/audit.cpp src/coarse_image.cpp vendor/shape_based_matching/line2Dup.cpp
+    src/audit.cpp src/coarse_image.cpp src/rescue_score.cpp
+    vendor/shape_based_matching/line2Dup.cpp
     ${VF_GPU_SOURCES})
 target_include_directories(visionforge_shape PRIVATE include src ${OpenCV_INCLUDE_DIRS}
     vendor/shape_based_matching vendor/shape_based_matching/MIPP)
@@ -141,6 +142,7 @@ if(VF_SHAPE_BUILD_TESTS)
     add_test(NAME shape_polygon_mask COMMAND shape_polygon_mask_test)
     add_executable(shape_witness_test tests/witness_test.cpp src/matcher.cpp
         src/model_codec.cpp src/coarse_image.cpp src/geometric_refinement.cpp
+        src/rescue_score.cpp
         vendor/shape_based_matching/line2Dup.cpp)
     target_include_directories(shape_witness_test PRIVATE include src ${OpenCV_INCLUDE_DIRS}
         vendor/shape_based_matching vendor/shape_based_matching/MIPP)
@@ -149,13 +151,28 @@ if(VF_SHAPE_BUILD_TESTS)
         target_compile_options(shape_witness_test PRIVATE /utf-8 /EHsc)
     endif()
     add_test(NAME shape_witness COMMAND shape_witness_test)
+    # 遮挡救分：估计器/重整纯函数单测 + 清洁等价与救活集成 + 离线审计模式
+    #（--v-audit 先决单调性门 / --fp-probe 假峰带采样·门槛=编译期 β·T，python 驱动调用）
+    add_executable(shape_occlusion_rescue_test tests/occlusion_rescue_test.cpp
+        src/rescue_score.cpp src/matcher.cpp src/two_stage.cpp src/two_stage_train.cpp
+        src/geometric_refinement.cpp src/coarse_image.cpp src/polygon.cpp
+        vendor/shape_based_matching/line2Dup.cpp)
+    target_include_directories(shape_occlusion_rescue_test PRIVATE include src
+        ${OpenCV_INCLUDE_DIRS} vendor/shape_based_matching
+        vendor/shape_based_matching/MIPP)
+    target_link_libraries(shape_occlusion_rescue_test PRIVATE ${OpenCV_LIBS}
+        Threads::Threads)
+    if(MSVC)
+        target_compile_options(shape_occlusion_rescue_test PRIVATE /utf-8 /EHsc)
+    endif()
+    add_test(NAME shape_occlusion_rescue COMMAND shape_occlusion_rescue_test)
     # Windows 下 opencv_world 运行库按 PATH 解析：ctest 环境注入 OpenCV bin，
     # 防 loader 找不到 DLL 时向桌面弹系统错误框（测试/构建产物禁止以弹窗
     # 形态触达决策人桌面——常设纪律）。bin 与 OpenCV_DIR(lib) 同级。
     set(VF_TEST_ENV "PATH=${OpenCV_DIR}/../bin\\;$ENV{PATH}")
     set(VF_TEST_NAMES shape_geometry shape_frame shape_coarse_image shape_clustering
         shape_abi_chain shape_abi_tamper shape_diagnostics shape_audit shape_polygon
-        shape_polygon_mask shape_witness)
+        shape_polygon_mask shape_witness shape_occlusion_rescue)
     if(VF_SHAPE_CUDA)
         # W1 GPU 骨架冒烟：上下文 + Model 特征驻留 + 1080P 帧上传 + LUT 同源
         #（直编引擎源与 .cu，GPU 骨架不入公共 ABI——规划未决项 1 口径）

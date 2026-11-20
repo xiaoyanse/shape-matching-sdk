@@ -3,12 +3,14 @@
 
 #include "two_stage.hpp"
 #include "matching_profile.hpp"
+#include "rescue_score.hpp"
 #include "coarse_image.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <future>
+#include <optional>
 #include <vector>
 
 namespace vfshape {
@@ -83,6 +85,28 @@ constexpr double kAmbiguityScoreGap = 10.;
 // 双目标），其余窗串行补搜索并在达标去重候选数达 max_candidates 后早停
 constexpr size_t kMaxCoarseCandidates = 16;
 constexpr size_t kMaxFineWindows = 8;
+constexpr size_t kMaxCachedRescueWindows = 2;
+constexpr size_t kMaxCachedRescuePixels = 1024 * 1024;
+
+cv::Mat scale_fine_window(const cv::Mat& window, double scale) {
+    cv::Mat scaled = window;
+    cv::resize(window, scaled,
+               cv::Size(std::max(24, int(window.cols / scale)),
+                        std::max(24, int(window.rows / scale))),
+               0, 0, scale > 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
+    return scaled;
+}
+
+struct RescueWindow {
+    Model* fine = nullptr;
+    const GroupSpec* spec = nullptr;
+    cv::Mat source;
+    std::optional<PreparedFrame> prepared;
+    int x = 0, y = 0;
+    double scale = 1.0;
+    bool legacy_empty = false;
+    bool resize_source = false;
+};
 
 std::vector<vf_shape_candidate> cluster_candidates(std::vector<vf_shape_candidate>&& raw) {
     std::vector<vf_shape_candidate> objects;
@@ -108,6 +132,31 @@ std::vector<vf_shape_candidate> cluster_candidates(std::vector<vf_shape_candidat
         if (!merged) objects.push_back(current);
     }
     return objects;
+}
+
+std::vector<vf_shape_candidate> rescue_misses(
+    std::array<RescueWindow, kMaxFineWindows>& misses, double fine_th, double threshold,
+    MatchProfile& profile) {
+    std::vector<vf_shape_candidate> results;
+    for (size_t ci = 0; ci < misses.size(); ++ci) {
+        auto& miss = misses[ci];
+        if (!miss.fine) continue;
+        const cv::Mat source = miss.resize_source ? scale_fine_window(miss.source, miss.scale) : miss.source;
+        if (!miss.prepared) miss.prepared.emplace(prepare_frame(source, &miss.fine->detector));
+        int rescued = 0;
+        auto candidates = match_prepared_rescue(
+            *miss.fine, *miss.prepared, source, threshold, &profile.window_collect_best[ci],
+            &rescued, miss.legacy_empty ? std::optional<double>(fine_th) : std::nullopt);
+        miss.prepared.reset();
+        profile.rescued_candidates.fetch_add(rescued, std::memory_order_relaxed);
+        for (auto& candidate : candidates) {
+            reproject_candidate(candidate, miss.x, miss.y, *miss.spec, miss.scale);
+            results.push_back(candidate);
+        }
+    }
+    std::sort(results.begin(), results.end(),
+              [](const auto& a, const auto& b) { return a.score > b.score; });
+    return cluster_candidates(std::move(results));
 }
 
 // 早停计数与最终输出口径的单一实现（F08）：对候选集副本执行与收尾路径
@@ -163,6 +212,8 @@ std::vector<vf_shape_candidate> match_two_stage(
         fine_half = std::max(240.0, diag / 2.0 + 4.0 * model.k);
     }
     const double fine_th = std::max(50.0, threshold * 0.85);
+    const bool can_rescue = rescue_collect_gate(threshold) < threshold;
+    std::array<RescueWindow, kMaxFineWindows> misses;
     auto refine_window = [&](size_t ci) {
         profile.windows_searched.fetch_add(1, std::memory_order_relaxed);
         // 剖析槽仅 2 个（MatchProfile 契约）：前两窗入槽，其余窗记到本地空槽
@@ -191,10 +242,7 @@ std::vector<vf_shape_candidate> match_two_stage(
         const bool needs_scale = std::abs(cs - 1.0) > 0.02;
         if (needs_scale) {
             MatchProfile::Timer resize_timer(trace_window.resize_ms);
-            cv::resize(window, window_scaled,
-                       cv::Size(std::max(24, int(window.cols / cs)),
-                                std::max(24, int(window.rows / cs))),
-                       0, 0, cs > 1 ? cv::INTER_AREA : cv::INTER_LINEAR);
+            window_scaled = scale_fine_window(window, cs);
         }
         cv::Mat effective = window_scaled;
         std::vector<vf_shape_candidate> refined;
@@ -218,12 +266,14 @@ std::vector<vf_shape_candidate> match_two_stage(
             trace_window.deferred_levels += frame.features.preparedLevels() - ready;
             return matches;
         };
+        auto* selected = const_cast<Model*>(fine_model);
+        bool selected_uses_prepared = true;
         auto prepared = prepare(window_scaled);
-        refined = evaluate(*const_cast<Model*>(fine_model), prepared);
+        refined = evaluate(*selected, prepared);
         if (best_score(refined) < threshold && needs_scale) {
             ++trace_window.scale_retries;
             auto retry_frame = prepare(window);
-            auto retry = evaluate(*const_cast<Model*>(fine_model), retry_frame);
+            auto retry = evaluate(*selected, retry_frame);
             if (best_score(retry) > best_score(refined)) {
                 cs = 1.0;
                 effective = window;
@@ -238,9 +288,11 @@ std::vector<vf_shape_candidate> match_two_stage(
                 ++trace_window.group_retries;
                 const auto& cfg = alternate.config;
                 const auto& original = fine_model->config;
+                const bool reuse = cfg.weak_th == original.weak_th &&
+                                   cfg.strong_th == original.strong_th &&
+                                   cfg.feature_count == original.feature_count;
                 std::vector<vf_shape_candidate> retry;
-                if (cfg.weak_th == original.weak_th && cfg.strong_th == original.strong_th &&
-                    cfg.feature_count == original.feature_count) {
+                if (reuse) {
                     retry = evaluate(alternate, prepared);
                 } else {
                     retry = match(alternate, effective, fine_th);
@@ -248,13 +300,28 @@ std::vector<vf_shape_candidate> match_two_stage(
                 if (best_score(retry) > best_score(refined)) {
                     refined = std::move(retry);
                     spec = &model.groups[gi];
+                    selected = &alternate;
+                    selected_uses_prepared = reuse;
                 }
             }
         }
         profile.window_best[ci] = best_score(refined);
+        bool eligible = can_rescue && profile.window_best[ci] < threshold;
         for (auto& r : refined) {
             reproject_candidate(r, x0, y0, *spec, cs);
+            if (r.pose_ambiguous || r.center[0] < 0 || r.center[1] < 0) eligible = false;
             window_results.push_back(r);
+        }
+        if (eligible) {
+            auto& miss = misses[ci];
+            miss = {selected, spec, window, std::nullopt, x0, y0, cs, refined.empty(),
+                    std::abs(cs - 1.0) > 0.02};
+            if (selected_uses_prepared && ci < kMaxCachedRescueWindows &&
+                size_t(prepared.padded_width) * prepared.padded_height <= kMaxCachedRescuePixels) {
+                miss.source = effective;
+                miss.resize_source = false;
+                miss.prepared.emplace(std::move(prepared));
+            }
         }
         return window_results;
     };
@@ -289,8 +356,12 @@ std::vector<vf_shape_candidate> match_two_stage(
     std::sort(results.begin(), results.end(),
               [](const auto& a, const auto& b) { return a.score > b.score; });
     results = cluster_candidates(std::move(results));
+    const bool ambiguous = std::any_of(results.begin(), results.end(), [](const auto& candidate) {
+        return candidate.pose_ambiguous != 0;
+    });
     results.erase(std::remove_if(results.begin(), results.end(),
         [threshold](const auto& candidate) { return candidate.score < threshold; }), results.end());
+    if (results.empty() && !ambiguous) results = rescue_misses(misses, fine_th, threshold, profile);
     if (!results.empty() && !model.b7.px.empty()) {
         auto& best = results.front();
         double angle = best.angle > 180 ? best.angle - 360 : best.angle;

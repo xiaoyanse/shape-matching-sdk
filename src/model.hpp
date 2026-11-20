@@ -96,4 +96,10 @@ std::vector<vf_shape_candidate> match(Model& model, const cv::Mat& image, double
 PreparedFrame prepare_frame(const cv::Mat& image, const Detector* detector = nullptr);
 void validate_search_budget(const Model& model, int width, int height);
 std::vector<vf_shape_candidate> match_prepared(Model& model, const PreparedFrame& frame, double threshold);
+// 帧填充：零边距补到 16 对齐（prepare_frame 与遮挡救分占用图共用同参重填充）
+cv::Mat pad_for_detector(const cv::Mat& image);
+// 命中→候选聚类（match_prepared 与遮挡救分路径共用的单一实现）
+std::vector<vf_shape_candidate> collect_hit_objects(Model& model,
+                                                    const std::vector<line2Dup::Match>& hits,
+                                                    const PreparedFrame& frame);
 }
