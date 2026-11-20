@@ -5,19 +5,40 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(VF_SHAPE_AVX2 "Build an experimental AVX2-only kernel" OFF)
 option(VF_SHAPE_PARALLEL_WINDOWS "Evaluate two independent refinement windows concurrently" ON)
 option(VF_SHAPE_PROFILE_STAGES "Emit per-call diagnostic timings and retry counters" OFF)
+option(VF_SHAPE_CUDA "Build the CUDA backend (W1 skeleton: residency + frame upload; static cudart)" OFF)
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui)
 find_package(Threads REQUIRED)
+if(VF_SHAPE_CUDA)
+    enable_language(CUDA)
+    # 加载方案（gpu-port-phase0 §二拍板·甲）：单 DLL + 静态 cudart，免运行时再分发
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    # 三代 fatbin 仅嵌 SASS 无 PTX（沿尖峰口径：跨更代架构需重编）
+    set(CMAKE_CUDA_ARCHITECTURES 86-real;89-real;120-real)
+    # 坑表（尖峰 README）：宿主 MSVC 源字符集须经 -Xcompiler 传递；
+    # .cu 字符串字面量保持 ASCII（nvcc 前端按系统代码页词法分析）
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+endif()
+set(VF_GPU_SOURCES)
+if(VF_SHAPE_CUDA)
+    list(APPEND VF_GPU_SOURCES src/gpu/gpu_device.cu src/gpu/gpu_backend.cpp)
+endif()
 add_library(visionforge_shape SHARED
     src/abi.cpp src/model_codec.cpp src/matcher.cpp src/polygon.cpp src/two_stage.cpp
     src/two_stage_train.cpp src/container_codec.cpp src/geometric_refinement.cpp
-    src/audit.cpp src/coarse_image.cpp vendor/shape_based_matching/line2Dup.cpp)
+    src/audit.cpp src/coarse_image.cpp vendor/shape_based_matching/line2Dup.cpp
+    ${VF_GPU_SOURCES})
 target_include_directories(visionforge_shape PRIVATE include src ${OpenCV_INCLUDE_DIRS}
     vendor/shape_based_matching vendor/shape_based_matching/MIPP)
 target_link_libraries(visionforge_shape PRIVATE ${OpenCV_LIBS} Threads::Threads)
 set_target_properties(visionforge_shape PROPERTIES CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES INSTALL_RPATH "$ORIGIN")
 if(MSVC)
-    target_compile_options(visionforge_shape PRIVATE /W3 /utf-8 /EHsc)
+    # COMPILE_LANGUAGE 限定：MSVC 裸选项不得透传 nvcc（会被当作输入文件）
+    target_compile_options(visionforge_shape PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/W3> $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
 else()
     target_compile_options(visionforge_shape PRIVATE -Wall -Wextra)
 endif()
@@ -132,8 +153,26 @@ if(VF_SHAPE_BUILD_TESTS)
     # 防 loader 找不到 DLL 时向桌面弹系统错误框（测试/构建产物禁止以弹窗
     # 形态触达决策人桌面——常设纪律）。bin 与 OpenCV_DIR(lib) 同级。
     set(VF_TEST_ENV "PATH=${OpenCV_DIR}/../bin\\;$ENV{PATH}")
-    set_tests_properties(shape_geometry shape_frame shape_coarse_image shape_clustering
+    set(VF_TEST_NAMES shape_geometry shape_frame shape_coarse_image shape_clustering
         shape_abi_chain shape_abi_tamper shape_diagnostics shape_audit shape_polygon
-        shape_polygon_mask shape_witness
-        PROPERTIES ENVIRONMENT "${VF_TEST_ENV}")
+        shape_polygon_mask shape_witness)
+    if(VF_SHAPE_CUDA)
+        # W1 GPU 骨架冒烟：上下文 + Model 特征驻留 + 1080P 帧上传 + LUT 同源
+        #（直编引擎源与 .cu，GPU 骨架不入公共 ABI——规划未决项 1 口径）
+        add_executable(shape_gpu_residency_test tests/gpu_residency_test.cpp
+            src/gpu/gpu_device.cu src/gpu/gpu_backend.cpp src/matcher.cpp src/polygon.cpp
+            vendor/shape_based_matching/line2Dup.cpp)
+        target_include_directories(shape_gpu_residency_test PRIVATE include src
+            ${OpenCV_INCLUDE_DIRS} vendor/shape_based_matching
+            vendor/shape_based_matching/MIPP)
+        target_link_libraries(shape_gpu_residency_test PRIVATE ${OpenCV_LIBS}
+            Threads::Threads)
+        if(MSVC)
+            target_compile_options(shape_gpu_residency_test PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+        endif()
+        add_test(NAME shape_gpu_residency COMMAND shape_gpu_residency_test)
+        list(APPEND VF_TEST_NAMES shape_gpu_residency)
+    endif()
+    set_tests_properties(${VF_TEST_NAMES} PROPERTIES ENVIRONMENT "${VF_TEST_ENV}")
 endif()
