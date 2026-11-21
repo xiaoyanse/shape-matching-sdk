@@ -63,6 +63,34 @@ void initial_candidates(const std::vector<uint16_t>& resp, int W, int H,
         }
 }
 
+// initial 全 pose 提取 + 预算（vendor matchClass :1373-1376 同式：逐 pose 累计，
+// 超 200000 中断报错）。候选序 = pose 序内行主序（refine 消费与外部窗分对齐口径）。
+bool run_initial_phase(const std::vector<std::vector<uint16_t>>& resp1, int resp_w1,
+                       int resp_h1, const ExtractPoses& poses, int frame_w0, int frame_h0,
+                       float threshold, std::vector<CoarseCand>& candidates, int& initial_count,
+                       std::string& err) {
+    candidates.clear();
+    initial_count = 0;
+    for (int id = 0; id < int(poses.level1.size()); ++id) {
+        const auto& level1 = poses.level1[size_t(id)];
+        const auto& level0 = poses.level0[size_t(id)];
+        if (int(level1.feats.size()) >= kMaxFeatures || int(level0.feats.size()) >= kMaxFeatures) {
+            err = "extract feature count too large";
+            return false;
+        }
+        if (!template_fits(level0, level1, frame_w0, frame_h0, frame_w0 / 2, frame_h0 / 2))
+            continue;
+        if (level1.feats.empty()) continue;
+        initial_candidates(resp1[size_t(id)], resp_w1, resp_h1, level1, threshold, id, candidates);
+        initial_count = int(candidates.size());
+        if (initial_count > kInitialBudget) {
+            err = "candidate budget exceeded";
+            return false;
+        }
+    }
+    return true;
+}
+
 // 每帧一次线性内存预烙（vendor linearizeResponses :820-841 同布局）：8 label ×
 // T*T 相位行 × W*Hc 格连续平面，值 = 响应查表预烙。平面尾镜像首段 = 行尾 flat
 // 续读的确定性化——越界读 ≡ 回卷相位行 0（W2-A 先例口径），镜像按字节等值
@@ -134,11 +162,54 @@ void accumulate_window(const LinearMemory& lm, const ExtractPoses::Level& level0
 
 }  // namespace
 
+bool extract_initial_candidates(
+    const std::vector<std::vector<uint16_t>>& resp1, int resp_w1, int resp_h1,
+    const ExtractPoses& poses, int frame_w0, int frame_h0, float threshold,
+    std::vector<InitialCandidate>& out_cands, std::string& err) {
+    out_cands.clear();
+    const auto bad = [&](const std::string& msg) {
+        err = msg;
+        out_cands.clear();
+        return false;
+    };
+    const int pose_count = int(poses.level1.size());
+    if (pose_count == 0 || int(poses.level0.size()) != pose_count)
+        return bad("extract poses: level1/level0 pose count mismatch");
+    if (int(resp1.size()) != pose_count) return bad("extract resp1 pose count mismatch");
+    for (int id = 0; id < pose_count; ++id)
+        if (resp1[size_t(id)].size() != size_t(resp_w1) * size_t(resp_h1))
+            return bad("extract resp buffer size mismatch");
+    if (frame_w0 <= 0 || frame_h0 <= 0) return bad("extract dims must be positive");
+    if (frame_w0 % kT[0] || frame_h0 % kT[0])
+        return bad("extract frame dims must be multiples of coarse T");
+    if (resp_w1 != frame_w0 / 2 / kT[1] || resp_h1 != frame_h0 / 2 / kT[1])
+        return bad("extract resp grid dims mismatch frame dims");
+
+    std::vector<CoarseCand> candidates;
+    int initial_count = 0;
+    if (!run_initial_phase(resp1, resp_w1, resp_h1, poses, frame_w0, frame_h0, threshold,
+                           candidates, initial_count, err))
+        return bad(err);
+    const int border0 = 8 * kT[0];
+    out_cands.resize(candidates.size());
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto& cand = candidates[i];
+        const auto& level0 = poses.level0[size_t(cand.pose_id)];
+        int x = std::max(cand.x * 2 + 1, border0);
+        int y = std::max(cand.y * 2 + 1, border0);
+        x = std::min(x, frame_w0 - level0.width - border0);
+        y = std::min(y, frame_h0 - level0.height - border0);
+        out_cands[i] = {x, y, cand.pose_id};
+    }
+    return true;
+}
+
 bool extract_coarse_candidates(
     const std::vector<std::vector<uint16_t>>& resp1, int resp_w1, int resp_h1,
     const std::vector<uint8_t>& spread0, int spread_w, int spread_h,
     const ExtractPoses& poses, int frame_w0, int frame_h0,
-    float threshold, ExtractResult& out, std::string& err) {
+    float threshold, ExtractResult& out, std::string& err,
+    const std::vector<uint16_t>* external_scores) {
     out.matches.clear();
     out.extract_ms = 0;
     out.initial_count = 0;
@@ -175,24 +246,21 @@ bool extract_coarse_candidates(
     // initial 全 pose 提取 + 预算（vendor matchClass :1373-1376 同式：逐 pose 累计，
     // 超 200000 中断；GPU 路径语义=清空报错，与引擎 search budget 报错口径一致）
     std::vector<CoarseCand> candidates;
-    for (int id = 0; id < pose_count; ++id) {
-        const auto& level1 = poses.level1[size_t(id)];
-        const auto& level0 = poses.level0[size_t(id)];
-        if (int(level1.feats.size()) >= kMaxFeatures || int(level0.feats.size()) >= kMaxFeatures)
-            return fail("extract feature count too large");
-        if (!template_fits(level0, level1, frame_w0, frame_h0, frame_w1, frame_h1)) continue;
-        if (level1.feats.empty()) continue;
-        initial_candidates(resp1[size_t(id)], resp_w1, resp_h1, level1, threshold, id, candidates);
-        out.initial_count = int(candidates.size());
-        if (out.initial_count > kInitialBudget) return fail("candidate budget exceeded");
-    }
+    if (!run_initial_phase(resp1, resp_w1, resp_h1, poses, frame_w0, frame_h0, threshold,
+                           candidates, out.initial_count, err))
+        return fail(err);
+
+    // 外部窗分（W3）：按 initial 候选序整批校验后逐候选消费
+    if (external_scores &&
+        external_scores->size() != candidates.size() * size_t(256))
+        return fail("external window scores count mismatch");
 
     // 精化环（vendor matchClass :1409-1498，pyramid_levels=2 → 单 l=0 轮）+
     // MatchPredicate 过滤（:1501-1503 同式）；窗分消费每帧预烙线性内存。
     // 分片按 pose 边界（候选 pose-major 连续），片结果按序拼接 = 单线程全同；
     // 候选独立计算、全局 sort 在拼接后，线程数不影响输出序列。
     LinearMemory lm;
-    build_linear_memory(spread0, frame_w0, frame_h0, lm);
+    if (!external_scores) build_linear_memory(spread0, frame_w0, frame_h0, lm);
     const int T0 = kT[0], offset0 = grid_offset(T0);
     const int border0 = 8 * T0;
     auto refine_slice = [&](size_t begin, size_t end, std::vector<line2Dup::Match>& sink) {
@@ -205,8 +273,13 @@ bool extract_coarse_candidates(
             x = std::min(x, frame_w0 - level0.width - border0);
             y = std::min(y, frame_h0 - level0.height - border0);
             int16_t window[256];
-            std::memset(window, 0, sizeof(window));
-            accumulate_window(lm, level0, x, y, window);
+            if (external_scores) {
+                const uint16_t* src = external_scores->data() + i * size_t(256);
+                for (int j = 0; j < 256; ++j) window[size_t(j)] = int16_t(src[j]);
+            } else {
+                std::memset(window, 0, sizeof(window));
+                accumulate_window(lm, level0, x, y, window);
+            }
             // 行主序首最大（严格 >，vendor :1453-1470 同式）
             float best_score = 0;
             int best_r = -1, best_c = -1;

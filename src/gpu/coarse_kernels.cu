@@ -268,21 +268,32 @@ constexpr int kStageCount = 7;
 
 bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
                       bool readback_maps, CoarseResult& out, CoarseTiming* timing,
-                      std::string& err, bool need_l0_response) {
+                      std::string& err, bool need_l0_response, int model_slot,
+                      int frame_slot) {
     if (!ctx) {
         err = "null context";
         return false;
     }
-    if (!ctx->features_ready || !ctx->dims_ready) {
+    const bool slot1 = model_slot == 1;
+    const bool features_ok =
+        slot1 ? ctx->fine_features_ready[frame_slot] : ctx->features_ready;
+    const bool dims_ok = slot1 ? ctx->fine_dims_ready[frame_slot] : ctx->dims_ready;
+    const int resident_poses =
+        slot1 ? ctx->fine_resident_poses[frame_slot] : ctx->resident_poses;
+    if (!features_ok || !dims_ok) {
         err = "features/template dims not resident";
         return false;
     }
-    if (poses <= 0 || poses > ctx->resident_poses) {
+    if (poses <= 0 || poses > resident_poses) {
         err = "pose count out of residency";
         return false;
     }
-    LevelBuffers &L0 = ctx->level[0], &L1 = ctx->level[1];
-    const int w = L0.w, h = L0.h, w1 = L1.w, h1 = L1.h;
+    LevelBuffers &L0 = ctx->face[frame_slot][0], &L1 = ctx->face[frame_slot][1];
+    uint16_t* response_dev = ctx->response[frame_slot];
+    const int w = ctx->cur_w[frame_slot] ? ctx->cur_w[frame_slot] : L0.w,
+              h = ctx->cur_h[frame_slot] ? ctx->cur_h[frame_slot] : L0.h;
+    const int w1 = ctx->cur_w[frame_slot] ? w / 2 : L1.w,
+              h1 = ctx->cur_h[frame_slot] ? h / 2 : L1.h;
     if (w % kT0 || h % kT0 || w1 % kT1 || h1 % kT1) {
         err = "level dims must be multiples of T (engine padded frame)";
         return false;
@@ -347,18 +358,22 @@ bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
 
     // —— sim_full L1（前半 L1 slot；响应缓冲复用，L1 先回读再跑 L0）——
     // feats 驻留缓冲为 Feature4（与 int4 逐字段同布局，upload 侧按 int4 打包）
-    const int4* feats_i4 = reinterpret_cast<const int4*>(ctx->feats);
+    const int4* feats_i4 =
+        reinterpret_cast<const int4*>(slot1 ? ctx->fine_feats[frame_slot] : ctx->feats);
+    const int* feat_begin = slot1 ? ctx->fine_begin[frame_slot] : ctx->feat_begin;
+    const int* feat_count = slot1 ? ctx->fine_count[frame_slot] : ctx->feat_count;
+    const int2* templ_dims = slot1 ? ctx->fine_dims[frame_slot] : ctx->templ_dims;
     mark(3);
     if (poses > 0) {
         const dim3 grid((W1 * H1 + kBlockX - 1) / kBlockX, poses);
         if (vendor)
-            k_sim_full<true><<<grid, kBlockX>>>(L1.spread, w1, h1, feats_i4, ctx->feat_begin,
-                                                ctx->feat_count, ctx->templ_dims, kT1, W1, H1,
-                                                ctx->response);
+            k_sim_full<true><<<grid, kBlockX>>>(L1.spread, w1, h1, feats_i4, feat_begin,
+                                                feat_count, templ_dims, kT1, W1, H1,
+                                                response_dev);
         else
-            k_sim_full<false><<<grid, kBlockX>>>(L1.spread, w1, h1, feats_i4, ctx->feat_begin,
-                                                 ctx->feat_count, ctx->templ_dims, kT1, W1, H1,
-                                                 ctx->response);
+            k_sim_full<false><<<grid, kBlockX>>>(L1.spread, w1, h1, feats_i4, feat_begin,
+                                                 feat_count, templ_dims, kT1, W1, H1,
+                                                 response_dev);
         LAUNCH_CHECK();
     }
     mark_end(3);
@@ -368,7 +383,7 @@ bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
     out.response[1].assign(size_t(poses), {});
     {
         std::vector<uint16_t> flat(size_t(poses) * W1 * H1);
-        CUDA_CHECK(cudaMemcpy(flat.data(), ctx->response, flat.size() * sizeof(uint16_t),
+        CUDA_CHECK(cudaMemcpy(flat.data(), response_dev, flat.size() * sizeof(uint16_t),
                               cudaMemcpyDeviceToHost));
         for (int id = 0; id < poses; ++id)
             out.response[1][size_t(id)].assign(
@@ -410,14 +425,14 @@ bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
         const dim3 grid((W0 * H0 + kBlockX - 1) / kBlockX, poses);
         if (vendor)
             k_sim_full<true><<<grid, kBlockX>>>(
-                L0.spread, w, h, feats_i4, ctx->feat_begin + ctx->pose_capacity,
-                ctx->feat_count + ctx->pose_capacity, ctx->templ_dims + ctx->pose_capacity,
-                kT0, W0, H0, ctx->response);
+                L0.spread, w, h, feats_i4, feat_begin + ctx->pose_capacity,
+                feat_count + ctx->pose_capacity, templ_dims + ctx->pose_capacity,
+                kT0, W0, H0, response_dev);
         else
             k_sim_full<false><<<grid, kBlockX>>>(
-                L0.spread, w, h, feats_i4, ctx->feat_begin + ctx->pose_capacity,
-                ctx->feat_count + ctx->pose_capacity, ctx->templ_dims + ctx->pose_capacity,
-                kT0, W0, H0, ctx->response);
+                L0.spread, w, h, feats_i4, feat_begin + ctx->pose_capacity,
+                feat_count + ctx->pose_capacity, templ_dims + ctx->pose_capacity,
+                kT0, W0, H0, response_dev);
         LAUNCH_CHECK();
     }
     mark_end(6);
@@ -427,7 +442,7 @@ bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
     if (need_l0_response) {
         out.response[0].assign(size_t(poses), {});
         std::vector<uint16_t> flat(size_t(poses) * W0 * H0);
-        CUDA_CHECK(cudaMemcpy(flat.data(), ctx->response, flat.size() * sizeof(uint16_t),
+        CUDA_CHECK(cudaMemcpy(flat.data(), response_dev, flat.size() * sizeof(uint16_t),
                               cudaMemcpyDeviceToHost));
         for (int id = 0; id < poses; ++id)
             out.response[0][size_t(id)].assign(
@@ -465,6 +480,114 @@ bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                       start_wall).count();
     }
+    return true;
+}
+
+bool run_coarse_chain_async(GpuContext* ctx, int poses, float weak, void* stream_handle,
+                            uint16_t* resp1_pinned, size_t resp1_bytes, int& resp_w1,
+                            int& resp_h1, const uint8_t** spread0_dev, int& spread_w0,
+                            int& spread_h0, void* e_chain_begin, void* e_resp1,
+                            void* e_chain_end, int model_slot, int frame_slot,
+                            std::string& err) {
+    if (!ctx) {
+        err = "null context";
+        return false;
+    }
+    if (!stream_handle || !resp1_pinned || !e_resp1 || !e_chain_end || !e_chain_begin) {
+        err = "null stream/pinned/event";
+        return false;
+    }
+    const bool slot1 = model_slot == 1;
+    const bool features_ok =
+        slot1 ? ctx->fine_features_ready[frame_slot] : ctx->features_ready;
+    const bool dims_ok = slot1 ? ctx->fine_dims_ready[frame_slot] : ctx->dims_ready;
+    const int resident_poses =
+        slot1 ? ctx->fine_resident_poses[frame_slot] : ctx->resident_poses;
+    if (!features_ok || !dims_ok) {
+        err = "features/template dims not resident";
+        return false;
+    }
+    if (poses <= 0 || poses > resident_poses) {
+        err = "pose count out of residency";
+        return false;
+    }
+    cudaStream_t stream = (cudaStream_t)stream_handle;
+    LevelBuffers &L0 = ctx->face[frame_slot][0], &L1 = ctx->face[frame_slot][1];
+    const int4* feats_i4 =
+        reinterpret_cast<const int4*>(slot1 ? ctx->fine_feats[frame_slot] : ctx->feats);
+    const int* feat_begin =
+        slot1 ? ctx->fine_begin[frame_slot] : ctx->feat_begin;
+    const int* feat_count =
+        slot1 ? ctx->fine_count[frame_slot] : ctx->feat_count;
+    const int2* templ_dims = slot1 ? ctx->fine_dims[frame_slot] : ctx->templ_dims;
+    uint16_t* response_dev = ctx->response[frame_slot];
+    const int w = ctx->cur_w[frame_slot] ? ctx->cur_w[frame_slot] : L0.w,
+              h = ctx->cur_h[frame_slot] ? ctx->cur_h[frame_slot] : L0.h;
+    const int w1 = ctx->cur_w[frame_slot] ? w / 2 : L1.w,
+              h1 = ctx->cur_h[frame_slot] ? h / 2 : L1.h;
+    if (w % kT0 || h % kT0 || w1 % kT1 || h1 % kT1) {
+        err = "level dims must be multiples of T (engine padded frame)";
+        return false;
+    }
+    const int W1 = w1 / kT1, H1 = h1 / kT1, W0 = w / kT0, H0 = h / kT0;
+    if (size_t(poses) * W0 * H0 > ctx->response_capacity) {
+        err = "response capacity insufficient";
+        return false;
+    }
+    if (size_t(resp1_bytes) != size_t(poses) * W1 * H1 * sizeof(uint16_t)) {
+        err = "resp1 pinned size mismatch";
+        return false;
+    }
+    const float weak_sq = weak * weak;
+    const dim3 block(kBlockX, kBlockY);
+    const auto grid2d = [](int tw, int th) {
+        return dim3((tw + kBlockX - 1) / kBlockX, (th + kBlockY - 1) / kBlockY);
+    };
+    cudaEventRecord((cudaEvent_t)e_chain_begin, stream);
+
+    // —— L1 链：pyrDown → blur → grad → hysteresis → spread(T=8)（发射序与
+    // 同步版逐项一致，仅目标流不同）——
+    k_pyrdown<<<grid2d(w1, h1), block, 0, stream>>>(L0.bgr, w, h, L1.smooth, w1, h1);
+    LAUNCH_CHECK();
+    k_blur_h<<<grid2d(w1, h1), block, 0, stream>>>(L1.smooth, w1, h1, L1.blur_tmp);
+    k_blur_v<<<grid2d(w1, h1), block, 0, stream>>>(L1.blur_tmp, w1, h1, L1.bgr);
+    k_grad_quant<true><<<grid2d(w1, h1), block, 0, stream>>>(L1.bgr, w1, h1, L1.bucket, L1.mag);
+    k_hysteresis<<<grid2d(w1, h1), block, 0, stream>>>(L1.bucket, L1.mag, w1, h1, weak_sq,
+                                                       L1.angle);
+    LAUNCH_CHECK();
+    k_spread_h<<<grid2d(w1, h1), block, 0, stream>>>(L1.angle, L1.spread_h, w1, h1, kT1);
+    k_spread_v<<<grid2d(w1, h1), block, 0, stream>>>(L1.spread_h, L1.spread, w1, h1, kT1);
+    LAUNCH_CHECK();
+
+    // —— sim_full L1 + resp1 异步回读（L0 链之前入队，宿主扫描与 L0 链重叠）——
+    if (poses > 0) {
+        const dim3 grid((W1 * H1 + kBlockX - 1) / kBlockX, poses);
+        k_sim_full<true><<<grid, kBlockX, 0, stream>>>(L1.spread, w1, h1, feats_i4, feat_begin,
+                                                       feat_count, templ_dims, kT1, W1, H1,
+                                                       response_dev);
+        LAUNCH_CHECK();
+    }
+    resp_w1 = W1;
+    resp_h1 = H1;
+    CUDA_CHECK(cudaMemcpyAsync(resp1_pinned, response_dev,
+                               size_t(poses) * W1 * H1 * sizeof(uint16_t),
+                               cudaMemcpyDeviceToHost, stream));
+    cudaEventRecord((cudaEvent_t)e_resp1, stream);
+
+    // —— L0 链：blur → grad → hysteresis → spread(T=4)，lean 无 L0 全图响应 ——
+    k_blur_h<<<grid2d(w, h), block, 0, stream>>>(L0.bgr, w, h, L0.blur_tmp);
+    k_blur_v<<<grid2d(w, h), block, 0, stream>>>(L0.blur_tmp, w, h, L0.smooth);
+    k_grad_quant<true><<<grid2d(w, h), block, 0, stream>>>(L0.smooth, w, h, L0.bucket, L0.mag);
+    k_hysteresis<<<grid2d(w, h), block, 0, stream>>>(L0.bucket, L0.mag, w, h, weak_sq, L0.angle);
+    LAUNCH_CHECK();
+    k_spread_h<<<grid2d(w, h), block, 0, stream>>>(L0.angle, L0.spread_h, w, h, kT0);
+    k_spread_v<<<grid2d(w, h), block, 0, stream>>>(L0.spread_h, L0.spread, w, h, kT0);
+    LAUNCH_CHECK();
+
+    *spread0_dev = L0.spread;
+    spread_w0 = w;
+    spread_h0 = h;
+    cudaEventRecord((cudaEvent_t)e_chain_end, stream);
     return true;
 }
 

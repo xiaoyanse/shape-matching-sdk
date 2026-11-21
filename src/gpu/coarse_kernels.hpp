@@ -39,13 +39,30 @@ struct CoarseTiming {
     double wall_ms = 0;
 };
 
-// 跑一次粗层链（帧已 upload_frame；features+templ_dims 已驻留）。timing 可空
-//（对拍轮次免事件开销）。response 缓冲两级复用，L1 段先回读再算 L0。
+// 跑一次粗层链（帧已 upload_frame；目标槽 features+templ_dims 已驻留）。timing
+// 可空（对拍轮次免事件开销）。response 缓冲两级复用，L1 段先回读再算 L0。
 // need_l0_response=false = 宿主提取精益模式：跳过 L0 全图响应内核+回读与
 // L1 angle/spread 回读，只产出 response[1]+spread[0]（引擎接缝口径）；
-// 默认 true = W2-A 对拍行为零变化。
+// 默认 true = W2-A 对拍行为零变化。model_slot 选模型驻留槽（0=coarse，
+// 1=fine 窗，W3）；帧档取 upload_frame_capacity 记录的当前档（未记录则回退
+// 建档档，W2 直驱对拍路径行为不变）。
 bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
                       bool readback_maps, CoarseResult& out, CoarseTiming* timing,
-                      std::string& err, bool need_l0_response = true);
+                      std::string& err, bool need_l0_response = true, int model_slot = 0,
+                      int frame_slot = 0);
+
+// 精修窗流水化专用异步链（W3 波2 补完）：与同步版同内核同参数同序（lean 口径
+// L1 链+L1 全图响应+L0 链，无 L0 全图响应/无 spread 回读），全部发射入指定流后
+// 即返回（发射即返回，设备完成由事件标记）；resp1 逐 pose 拼接异步回读到调用方
+// pinned 缓冲（resp1_bytes = poses*W1*H1*2）完成时记录 e_resp1（宿主 initial 扫描
+// 可与 L0 链重叠）；e_chain_begin/e_chain_end 包住全链供链路耗时测量。返回设备侧
+// L0 spread 指针与当前档网格尺寸（供流内窗分内核直接消费，不经宿主）。
+// 流/事件以 opaque 句柄传递（中立面不引入 CUDA 头）。
+bool run_coarse_chain_async(GpuContext* ctx, int poses, float weak, void* stream_handle,
+                            uint16_t* resp1_pinned, size_t resp1_bytes, int& resp_w1,
+                            int& resp_h1, const uint8_t** spread0_dev, int& spread_w0,
+                            int& spread_h0, void* e_chain_begin, void* e_resp1,
+                            void* e_chain_end, int model_slot, int frame_slot,
+                            std::string& err);
 
 }  // namespace vfshape::gpu

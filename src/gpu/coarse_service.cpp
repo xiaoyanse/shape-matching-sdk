@@ -1,12 +1,14 @@
-// 粗层 GPU 服务实现（coarse_service.hpp 语义）：上下文容量制懒创建、Model
-// 指纹守驻留缓存、帧路径 pad→upload→chain(VendorExact)→extract，收尾与
-// match() 同链（collect_hit_objects 复用）。失败一律编码错误直报。
+// 粗层 GPU 服务实现（coarse_service.hpp 语义）：进程级单上下文（共享状态见
+// service_shared.hpp，W3 起与精修窗服务同体）+ Model 指纹守驻留缓存 + 帧路径
+// pad→upload→chain(VendorExact)→extract，收尾与 match() 同链（collect_hit_objects
+// 复用）。失败一律编码错误直报。
 #include "coarse_service.hpp"
 
 #include "coarse_extract.hpp"
 #include "coarse_kernels.hpp"
 #include "error_code.hpp"
 #include "gpu_backend.hpp"
+#include "service_shared.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,93 +21,9 @@
 namespace vfshape::gpu {
 namespace {
 
-constexpr int kContextCandidates = 16;
-
-Backend backend_from_env() {
-    const char* value = std::getenv("VF_SHAPE_BACKEND");
-    return value != nullptr && std::strcmp(value, "gpu") == 0 ? Backend::Gpu : Backend::Cpu;
-}
-
-struct ServiceState {
-    GpuContext* ctx = nullptr;
-    int cap_w = 0, cap_h = 0, cap_poses = 0, cap_feats = 0;
-    const void* model_id = nullptr;
-    int resident_poses = 0, resident_features = 0;
-    long long resident_checksum = 0;
-};
-
-ServiceState& state() {
-    static ServiceState value;
-    return value;
-}
-
-std::mutex& service_mutex() {
-    static std::mutex value;
-    return value;
-}
-
 CoarseServiceStats& stats_slot() {
     static CoarseServiceStats value;
     return value;
-}
-
-[[noreturn]] void gpu_fail(const std::string& message) {
-    fail(VF_SHAPE_INTERNAL, {}, message.c_str());
-}
-
-struct ResidencyFingerprint {
-    int poses = 0, features = 0;
-    long long checksum = 0;
-};
-
-// 指纹带特征内容校验和：仅 pose 数+特征总数时，同址复用的新模型会假命中陈旧驻留
-ResidencyFingerprint fingerprint_of(const Model& model) {
-    ResidencyFingerprint fp;
-    fp.poses = int(model.poses.size());
-    for (int id = 0; id < fp.poses; ++id)
-        for (const auto& level : model.detector.getTemplates("shape", id))
-            for (const auto& f : level.features) {
-                ++fp.features;
-                fp.checksum += f.x * 2 + f.y * 4 + f.label;
-            }
-    return fp;
-}
-
-// upload_frame 要求帧档与上下文 L0 档严格相等：帧槽尺寸恒取当前帧档，帧档
-// 变化（含缩小）一律重建；位姿/特征容量只增不减；重建即驻留失效（重传）
-bool ensure_context(int pw, int ph, int poses, int features, std::string& err) {
-    ServiceState& s = state();
-    const bool needs_rebuild = s.ctx == nullptr || pw != s.cap_w || ph != s.cap_h ||
-                               poses > s.cap_poses || features > s.cap_feats;
-    if (!needs_rebuild) return true;
-    const int want_poses = std::max(s.cap_poses, poses);
-    const int want_feats = std::max(s.cap_feats, features);
-    destroy_context(s.ctx);
-    s.ctx = create_context(pw, ph, want_poses, want_feats, kContextCandidates,
-                           (pw / 4) * (ph / 4), err);
-    if (s.ctx == nullptr) {
-        s = ServiceState{};
-        return false;
-    }
-    s.cap_w = pw;
-    s.cap_h = ph;
-    s.cap_poses = want_poses;
-    s.cap_feats = want_feats;
-    s.model_id = nullptr;
-    return true;
-}
-
-bool ensure_residency(const Model& coarse, const ResidencyFingerprint& fp, std::string& err) {
-    ServiceState& s = state();
-    if (s.ctx != nullptr && s.model_id == &coarse && s.resident_poses == fp.poses &&
-        s.resident_features == fp.features && s.resident_checksum == fp.checksum)
-        return true;
-    if (!upload_model_features(s.ctx, coarse, err)) return false;
-    s.model_id = &coarse;
-    s.resident_poses = fp.poses;
-    s.resident_features = fp.features;
-    s.resident_checksum = fp.checksum;
-    return true;
 }
 
 bool build_extract_poses(const Model& coarse, ExtractPoses& poses, std::string& err) {
@@ -162,7 +80,8 @@ vf_shape_candidate candidate(const Model& model, const line2Dup::Match& hit, int
 }  // namespace
 
 Backend current_backend() {
-    return backend_from_env();
+    const char* value = std::getenv("VF_SHAPE_BACKEND");
+    return value != nullptr && std::strcmp(value, "gpu") == 0 ? Backend::Gpu : Backend::Cpu;
 }
 
 const CoarseServiceStats& last_call_stats() {
@@ -175,28 +94,28 @@ std::vector<vf_shape_candidate> match_coarse_gpu(Model& coarse, const cv::Mat& s
                   VF_SHAPE_THRESHOLD_INVALID, "invalid similarity threshold", threshold);
     validate_search_budget(coarse, small.cols, small.rows);
 
-    std::lock_guard<std::mutex> lock(service_mutex());
+    std::lock_guard<std::mutex> lock(svc::service_mutex());
     stats_slot() = {};
 
-    const ResidencyFingerprint fp = fingerprint_of(coarse);
+    const svc::ResidencyFingerprint fp = svc::fingerprint_of(coarse);
     const cv::Mat padded = pad_for_detector(small);
     const int pw = padded.cols, ph = padded.rows;
 
     std::string err;
-    if (!ensure_context(pw, ph, fp.poses, fp.features, err)) gpu_fail(err);
-    if (!ensure_residency(coarse, fp, err)) gpu_fail(err);
-    if (!upload_frame(state().ctx, padded.data, pw, ph, err)) gpu_fail(err);
+    if (!svc::ensure_context(pw, ph, fp.poses, fp.features, err)) svc::gpu_fail(err);
+    if (!svc::ensure_residency(0, coarse, fp, err)) svc::gpu_fail(err);
+    if (!upload_frame_capacity(svc::state().ctx, padded.data, pw, ph, err)) svc::gpu_fail(err);
 
     CoarseResult result;
     CoarseTiming timing;
     // 精益模式：提取只消费 response[1]+spread[0]，跳过 L0 全图响应与冗余回读
-    if (!run_coarse_chain(state().ctx, fp.poses, coarse.detector.tuned_weak,
+    if (!run_coarse_chain(svc::state().ctx, fp.poses, coarse.detector.tuned_weak,
                           CoarseMode::VendorExact, true, result, &timing, err,
                           /*need_l0_response=*/false))
-        gpu_fail(err);
+        svc::gpu_fail(err);
 
     ExtractPoses extract_poses;
-    if (!build_extract_poses(coarse, extract_poses, err)) gpu_fail(err);
+    if (!build_extract_poses(coarse, extract_poses, err)) svc::gpu_fail(err);
     ExtractResult extract_out;
     if (!extract_coarse_candidates(result.response[1], result.resp_w[1], result.resp_h[1],
                                    result.maps.spread[0], result.maps.w[0], result.maps.h[0],
@@ -206,7 +125,7 @@ std::vector<vf_shape_candidate> match_coarse_gpu(Model& coarse, const cv::Mat& s
         if (err == "candidate budget exceeded")
             fail(VF_SHAPE_SEARCH_BUDGET, {double(extract_out.initial_count), 200000.0},
                  err.c_str());
-        gpu_fail(err);
+        svc::gpu_fail(err);
     }
 
     CoarseServiceStats& stats = stats_slot();

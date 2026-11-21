@@ -23,7 +23,10 @@ struct ResidencyStats {
 // 从内存 Model 提特征驻留：读引擎 Detector 模板（getTemplates），不走容器
 // 解码路径。设备布局沿尖峰——feat_begin/feat_count 前半 = L1（slot=id）、
 // 后半 = L0（slot=pose_capacity+id），feats 单缓冲先 L1 后 L0 拼接。
+// model_slot=0/1 选模型驻留槽（0=coarse，1=fine 窗，W3 双槽并存各自失效），
+// 默认 0 沿 W2 行为。
 bool upload_model_features(GpuContext* ctx, const Model& model, std::string& err,
-                           ResidencyStats* stats = nullptr);
+                           ResidencyStats* stats = nullptr, int model_slot = 0,
+                           int frame_slot = 0);
 
 }  // namespace vfshape::gpu

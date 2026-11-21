@@ -5,6 +5,7 @@
 #ifdef VF_SHAPE_PROFILE_STAGES
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <sstream>
 #endif
@@ -22,6 +23,8 @@ struct MatchTraceSnapshot {
     std::array<double, 8> window_collect_best{};
     int rescued_candidates = 0;
     double coarse_ms = 0, coarse_resize_ms = 0, windows_ms = 0, finish_ms = 0;
+    // 重试计数（前两窗剖析槽合计；溢出窗槽外不计，与 windows 数组契约同界）
+    int scale_retries = 0, group_retries = 0;
 };
 
 class MatchProfile {
@@ -81,11 +84,16 @@ public:
         snap.coarse_resize_ms = coarse_resize_ms;
         snap.windows_ms = windows_ms;
         snap.finish_ms = finish_ms;
+        snap.scale_retries = windows[0].scale_retries + windows[1].scale_retries;
+        snap.group_retries = windows[0].group_retries + windows[1].group_retries;
         return snap;
     }
 
     ~MatchProfile() noexcept {
 #ifdef VF_SHAPE_PROFILE_STAGES
+        // 批量基准进程置 VF_SHAPE_TRACE_QUIET=1 免逐调用 JSON 淹没证据输出
+        static const bool trace_quiet = std::getenv("VF_SHAPE_TRACE_QUIET") != nullptr;
+        if (trace_quiet) return;
         try {
             std::ostringstream out;
             out << "VF_SHAPE_TRACE {\"coarse_ms\":" << coarse_ms + coarse_resize_ms

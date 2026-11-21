@@ -23,7 +23,8 @@ endif()
 set(VF_GPU_SOURCES)
 if(VF_SHAPE_CUDA)
     list(APPEND VF_GPU_SOURCES src/gpu/gpu_device.cu src/gpu/coarse_kernels.cu
-        src/gpu/gpu_backend.cpp src/gpu/coarse_extract.cpp src/gpu/coarse_service.cpp)
+        src/gpu/fine_windows.cu src/gpu/gpu_backend.cpp src/gpu/coarse_extract.cpp
+        src/gpu/coarse_service.cpp src/gpu/fine_service.cpp)
 endif()
 add_library(visionforge_shape SHARED
     src/abi.cpp src/model_codec.cpp src/matcher.cpp src/polygon.cpp src/two_stage.cpp
@@ -234,6 +235,25 @@ if(VF_SHAPE_BUILD_TESTS)
         add_test(NAME shape_coarse_extract COMMAND shape_coarse_extract_test)
         list(APPEND VF_TEST_NAMES shape_coarse_extract)
     endif()
+    # W3 波1 精修窗批量评分内核对拍：GPU run_window_scores vs 宿主 LM 镜像参考
+    # 逐位（行尾续读/Mat 尾取模锚）+ extract 外部窗分消费接缝等价 + 耗时 memo。
+    # OFF 构建编译跳行 main 返回 77（ctest Skipped 防假绿，同 bitexact 口径）。
+    add_executable(shape_fine_windows_test tests/fine_windows_test.cpp)
+    target_include_directories(shape_fine_windows_test PRIVATE include src
+        ${OpenCV_INCLUDE_DIRS} vendor/shape_based_matching vendor/shape_based_matching/MIPP)
+    target_link_libraries(shape_fine_windows_test PRIVATE ${OpenCV_LIBS} Threads::Threads)
+    if(MSVC)
+        target_compile_options(shape_fine_windows_test PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+    endif()
+    if(VF_SHAPE_CUDA)
+        target_sources(shape_fine_windows_test PRIVATE src/gpu/gpu_device.cu
+            src/gpu/coarse_kernels.cu src/gpu/fine_windows.cu src/gpu/coarse_extract.cpp)
+        target_compile_definitions(shape_fine_windows_test PRIVATE VF_SHAPE_CUDA=1)
+    endif()
+    add_test(NAME shape_fine_windows COMMAND shape_fine_windows_test)
+    list(APPEND VF_TEST_NAMES shape_fine_windows)
+    set_tests_properties(shape_fine_windows PROPERTIES SKIP_RETURN_CODE 77)
     # W2-B Part5 引擎级逐位对拍+coarse_ms ≥8× 性能门：match_two_stage 全链真装配
     # （引擎源直编测试目标——DLL 不导出内部 C++ 符号），VF_SHAPE_BACKEND 进程内
     # 翻转；OFF 构建无 CUDA main 返回 77（ctest Skipped，防假绿）。
@@ -252,13 +272,40 @@ if(VF_SHAPE_BUILD_TESTS)
     endif()
     if(VF_SHAPE_CUDA)
         target_sources(shape_engine_bitexact_test PRIVATE src/gpu/gpu_device.cu
-            src/gpu/coarse_kernels.cu src/gpu/gpu_backend.cpp src/gpu/coarse_extract.cpp
-            src/gpu/coarse_service.cpp)
+            src/gpu/coarse_kernels.cu src/gpu/fine_windows.cu src/gpu/gpu_backend.cpp
+            src/gpu/coarse_extract.cpp src/gpu/coarse_service.cpp src/gpu/fine_service.cpp)
         target_compile_definitions(shape_engine_bitexact_test PRIVATE VF_SHAPE_CUDA=1)
     endif()
     add_test(NAME shape_engine_bitexact COMMAND shape_engine_bitexact_test)
     list(APPEND VF_TEST_NAMES shape_engine_bitexact)
+    # W3 波3 引擎口径窗段性能门+全帧端到端实测：trace.windows_ms 全窗段 CPU vs
+    # GPU（fine_service 全窗墙钟）热稳态 300×100 中位，门 ≥2.0；全帧数据行不门
+    #（第三单裁决待定稿）。同 bitexact 防假绿口径：OFF 构建跳行 main 返回 77。
+    add_executable(shape_engine_bench_test tests/gpu_engine_bench_test.cpp
+        src/two_stage.cpp src/two_stage_train.cpp src/matcher.cpp src/polygon.cpp
+        src/coarse_image.cpp src/rescue_score.cpp src/geometric_refinement.cpp
+        vendor/shape_based_matching/line2Dup.cpp)
+    target_include_directories(shape_engine_bench_test PRIVATE include src
+        ${OpenCV_INCLUDE_DIRS} vendor/shape_based_matching
+        vendor/shape_based_matching/MIPP)
+    target_link_libraries(shape_engine_bench_test PRIVATE ${OpenCV_LIBS}
+        Threads::Threads)
+    if(MSVC)
+        target_compile_options(shape_engine_bench_test PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+    endif()
+    if(VF_SHAPE_CUDA)
+        target_sources(shape_engine_bench_test PRIVATE src/gpu/gpu_device.cu
+            src/gpu/coarse_kernels.cu src/gpu/fine_windows.cu src/gpu/gpu_backend.cpp
+            src/gpu/coarse_extract.cpp src/gpu/coarse_service.cpp src/gpu/fine_service.cpp)
+        # PROFILE_STAGES 仅此目标开启：windows_ms 毫秒字段依赖该宏填充（窗口段
+        # 门计量口径），trace JSON 输出经 VF_SHAPE_TRACE_QUIET 静默
+        target_compile_definitions(shape_engine_bench_test PRIVATE VF_SHAPE_CUDA=1
+            VF_SHAPE_PROFILE_STAGES=1)
+    endif()
+    add_test(NAME shape_engine_bench COMMAND shape_engine_bench_test)
+    list(APPEND VF_TEST_NAMES shape_engine_bench)
     set_tests_properties(${VF_TEST_NAMES} PROPERTIES ENVIRONMENT "${VF_TEST_ENV}")
-    set_tests_properties(shape_gpu_bitexact shape_engine_bitexact
+    set_tests_properties(shape_gpu_bitexact shape_engine_bitexact shape_engine_bench
         PROPERTIES SKIP_RETURN_CODE 77)
 endif()

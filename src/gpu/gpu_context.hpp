@@ -1,7 +1,8 @@
 #pragma once
 // GPU 设备面内部共享定义（仅 src/gpu/*.cu 包含，不对中性头暴露）：两级帧工作面
-// 缓冲布局、设备侧特征记录（int4）与不透明上下文实体。W2 起新增模板尺寸驻留
-// （templ_dims，vendor 相似度 span/回卷语义所需）与驻留就绪标志。
+// 缓冲布局、设备侧特征记录（int4）与不透明上下文实体。W2 模板尺寸驻留；W3 起
+// 帧工作面/响应/窗分暂存/fine 特征槽按 frame_slot 双份（粗精交替与流水化双 job
+// 并存的设备面隔离，默认槽 0 = W2 行为路径）。
 #include <cstddef>
 #include <cstdint>
 
@@ -22,15 +23,21 @@ struct Feature4 {
     int32_t x = 0, y = 0, label = 0, pad = 0;
 };
 
-// 上下文实体（gpu_device.hpp 前置声明；创建/销毁在 gpu_device.cu）
+// 上下文实体（gpu_device.hpp 前置声明；创建/销毁在 gpu_device.cu）。
+// frame_slot：0/1 双份工作面（流水化双 job 并存）；pyramid_level 沿 [级]。
 struct GpuContext {
-    LevelBuffers level[2];  // [0]=L0 全分辨率档，[1]=L1 半分辨率档
-    Feature4* feats = nullptr;
-    int *feat_begin = nullptr, *feat_count = nullptr;  // 前半 L1、后半 L0（尖峰布局）
-    int2* templ_dims = nullptr;  // 每位姿每层模板 (width,height)，同 begin/count 布局
-    uint16_t* response = nullptr;
-    int4* centers = nullptr;
-    uint16_t* window_scores = nullptr;
+    LevelBuffers face[2][2];  // [frame_slot][pyramid_level]：[x][0]=L0 档，[x][1]=L1 档
+    Feature4* feats = nullptr;   // coarse 模型特征（slot0，单份：串行粗层路径）
+    int *feat_begin = nullptr, *feat_count = nullptr;
+    int2* templ_dims = nullptr;
+    Feature4* fine_feats[2] = {nullptr, nullptr};   // fine 窗特征（slot1）×frame_slot
+    int* fine_begin[2] = {nullptr, nullptr};
+    int* fine_count[2] = {nullptr, nullptr};
+    int2* fine_dims[2] = {nullptr, nullptr};
+    uint16_t* response[2] = {nullptr, nullptr};     // 每 pose 全图响应 ×frame_slot
+    int4* centers[2] = {nullptr, nullptr};          // 窗分候选中心暂存 ×frame_slot
+    uint16_t* window_scores[2] = {nullptr, nullptr};
+    int candidate_capacity = 0;
     size_t response_capacity = 0;
     int pose_capacity = 0;
     int feat_capacity = 0;
@@ -38,6 +45,11 @@ struct GpuContext {
     int resident_feats = 0;
     bool features_ready = false;
     bool dims_ready = false;
+    int fine_resident_poses[2] = {0, 0};
+    int fine_resident_feats[2] = {0, 0};
+    bool fine_features_ready[2] = {false, false};
+    bool fine_dims_ready[2] = {false, false};
+    int cur_w[2] = {0, 0}, cur_h[2] = {0, 0};  // 各 frame_slot 容量上传后的当前帧档
 };
 
 }  // namespace vfshape::gpu

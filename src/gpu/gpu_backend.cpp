@@ -8,7 +8,7 @@
 namespace vfshape::gpu {
 
 bool upload_model_features(GpuContext* ctx, const Model& model, std::string& err,
-                           ResidencyStats* stats) {
+                           ResidencyStats* stats, int model_slot, int frame_slot) {
     if (!ctx) {
         err = "null context";
         return false;
@@ -49,9 +49,10 @@ bool upload_model_features(GpuContext* ctx, const Model& model, std::string& err
         }
     }
     if (!upload_features(ctx, feats.data(), int(feats.size()), begin.data(), count.data(),
-                         int(begin.size()), n, err))
+                         int(begin.size()), n, err, model_slot, frame_slot))
         return false;
-    if (!upload_template_dims(ctx, widths.data(), heights.data(), int(widths.size()), err))
+    if (!upload_template_dims(ctx, widths.data(), heights.data(), int(widths.size()), err,
+                              model_slot, frame_slot))
         return false;
     if (stats) {
         stats->pose_count = n;

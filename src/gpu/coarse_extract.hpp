@@ -33,13 +33,34 @@ struct ExtractResult {
     int initial_count = 0;                  // initialMatches 阶段候选数（诊断）
 };
 
+// initial 候选（clamp 后窗中心 + pose，与 extract_coarse_candidates 内部
+// initial 阶段完全同序；GPU 批量评分 run_window_scores 的候选形态）
+struct InitialCandidate {
+    int x = 0, y = 0;  // clamp 后窗中心（L0 像素坐标，vendor matchClass 同式）
+    int pose_id = 0;
+};
+
 // threshold：引擎粗层段传入的匹配阈（two_stage.cpp:192 的 max(45, T-20)）
 // 消费 L1 全图响应 + L0 spread 图，复刻 matchClass 全链（initial→精化→过滤→sort+unique）。
 // 预算超限（累计 initial 候选 >200000，vendor :1376 同式）= 清空+err 报错返回 false。
+// external_scores 非空（W3）：跳过宿主窗分自算（LM 预烙+accumulate_window），
+// 按 initial 候选序直接消费扁平窗分（run_window_scores 产物同布局：候选×256
+// uint16 行主序窗格；值域 <32768 由特征数护栏保证）——先用
+// extract_initial_candidates 取候选回填 GPU 窗分再传入。默认空 = 宿主自算，
+// 纯宿主路径零变化。
 bool extract_coarse_candidates(
     const std::vector<std::vector<uint16_t>>& resp1, int resp_w1, int resp_h1,
     const std::vector<uint8_t>& spread0, int spread_w, int spread_h,
     const ExtractPoses& poses, int frame_w0, int frame_h0,
-    float threshold, ExtractResult& out, std::string& err);
+    float threshold, ExtractResult& out, std::string& err,
+    const std::vector<uint16_t>* external_scores = nullptr);
+
+// initial 阶段独立出口：返回与主入口 initial 阶段同序同量的候选（含 clamp 后
+// 窗中心），供提取方先回填外部窗分。预算/特征数护栏语义同主入口；不消费
+// spread0（不做 spread 校验）。
+bool extract_initial_candidates(
+    const std::vector<std::vector<uint16_t>>& resp1, int resp_w1, int resp_h1,
+    const ExtractPoses& poses, int frame_w0, int frame_h0, float threshold,
+    std::vector<InitialCandidate>& out_cands, std::string& err);
 
 }  // namespace vfshape::gpu
