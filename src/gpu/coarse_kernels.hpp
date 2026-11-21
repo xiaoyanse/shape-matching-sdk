@@ -41,8 +41,11 @@ struct CoarseTiming {
 
 // 跑一次粗层链（帧已 upload_frame；features+templ_dims 已驻留）。timing 可空
 //（对拍轮次免事件开销）。response 缓冲两级复用，L1 段先回读再算 L0。
+// need_l0_response=false = 宿主提取精益模式：跳过 L0 全图响应内核+回读与
+// L1 angle/spread 回读，只产出 response[1]+spread[0]（引擎接缝口径）；
+// 默认 true = W2-A 对拍行为零变化。
 bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
                       bool readback_maps, CoarseResult& out, CoarseTiming* timing,
-                      std::string& err);
+                      std::string& err, bool need_l0_response = true);
 
 }  // namespace vfshape::gpu

@@ -23,7 +23,7 @@ endif()
 set(VF_GPU_SOURCES)
 if(VF_SHAPE_CUDA)
     list(APPEND VF_GPU_SOURCES src/gpu/gpu_device.cu src/gpu/coarse_kernels.cu
-        src/gpu/gpu_backend.cpp)
+        src/gpu/gpu_backend.cpp src/gpu/coarse_extract.cpp src/gpu/coarse_service.cpp)
 endif()
 add_library(visionforge_shape SHARED
     src/abi.cpp src/model_codec.cpp src/matcher.cpp src/polygon.cpp src/two_stage.cpp
@@ -55,6 +55,11 @@ if(VF_SHAPE_PARALLEL_WINDOWS)
 endif()
 if(VF_SHAPE_PROFILE_STAGES)
     target_compile_definitions(visionforge_shape PRIVATE VF_SHAPE_PROFILE_STAGES=1)
+endif()
+if(VF_SHAPE_CUDA)
+    # two_stage.cpp 粗层接缝按本宏条件化；仅主库目标定义（静态编 two_stage.cpp
+    # 的测试目标不接 GPU，避免 gpu 符号失链）
+    target_compile_definitions(visionforge_shape PRIVATE VF_SHAPE_CUDA=1)
 endif()
 install(TARGETS visionforge_shape RUNTIME DESTINATION . LIBRARY DESTINATION .)
 option(VF_SHAPE_BUILD_TESTS "Build native geometry regression tests" OFF)
@@ -212,6 +217,48 @@ if(VF_SHAPE_BUILD_TESTS)
     endif()
     add_test(NAME shape_gpu_bitexact COMMAND shape_gpu_bitexact_test)
     list(APPEND VF_TEST_NAMES shape_gpu_bitexact)
+    if(VF_SHAPE_CUDA)
+        # W2-B 宿主候选提取/精修单测：coarse_extract 纯 C++（无 CUDA 依赖），
+        # 仅 CUDA 构建注册（OFF 构建新文件不参与编译）
+        add_executable(shape_coarse_extract_test tests/coarse_extract_test.cpp
+            src/gpu/coarse_extract.cpp)
+        target_include_directories(shape_coarse_extract_test PRIVATE include src
+            ${OpenCV_INCLUDE_DIRS} vendor/shape_based_matching
+            vendor/shape_based_matching/MIPP)
+        target_link_libraries(shape_coarse_extract_test PRIVATE ${OpenCV_LIBS}
+            Threads::Threads)
+        if(MSVC)
+            target_compile_options(shape_coarse_extract_test PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+        endif()
+        add_test(NAME shape_coarse_extract COMMAND shape_coarse_extract_test)
+        list(APPEND VF_TEST_NAMES shape_coarse_extract)
+    endif()
+    # W2-B Part5 引擎级逐位对拍+coarse_ms ≥8× 性能门：match_two_stage 全链真装配
+    # （引擎源直编测试目标——DLL 不导出内部 C++ 符号），VF_SHAPE_BACKEND 进程内
+    # 翻转；OFF 构建无 CUDA main 返回 77（ctest Skipped，防假绿）。
+    add_executable(shape_engine_bitexact_test tests/gpu_engine_bitexact_test.cpp
+        src/two_stage.cpp src/two_stage_train.cpp src/matcher.cpp src/polygon.cpp
+        src/coarse_image.cpp src/rescue_score.cpp src/geometric_refinement.cpp
+        vendor/shape_based_matching/line2Dup.cpp)
+    target_include_directories(shape_engine_bitexact_test PRIVATE include src
+        ${OpenCV_INCLUDE_DIRS} vendor/shape_based_matching
+        vendor/shape_based_matching/MIPP)
+    target_link_libraries(shape_engine_bitexact_test PRIVATE ${OpenCV_LIBS}
+        Threads::Threads)
+    if(MSVC)
+        target_compile_options(shape_engine_bitexact_test PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+    endif()
+    if(VF_SHAPE_CUDA)
+        target_sources(shape_engine_bitexact_test PRIVATE src/gpu/gpu_device.cu
+            src/gpu/coarse_kernels.cu src/gpu/gpu_backend.cpp src/gpu/coarse_extract.cpp
+            src/gpu/coarse_service.cpp)
+        target_compile_definitions(shape_engine_bitexact_test PRIVATE VF_SHAPE_CUDA=1)
+    endif()
+    add_test(NAME shape_engine_bitexact COMMAND shape_engine_bitexact_test)
+    list(APPEND VF_TEST_NAMES shape_engine_bitexact)
     set_tests_properties(${VF_TEST_NAMES} PROPERTIES ENVIRONMENT "${VF_TEST_ENV}")
-    set_tests_properties(shape_gpu_bitexact PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(shape_gpu_bitexact shape_engine_bitexact
+        PROPERTIES SKIP_RETURN_CODE 77)
 endif()

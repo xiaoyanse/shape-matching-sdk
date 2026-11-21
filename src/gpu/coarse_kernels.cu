@@ -268,7 +268,7 @@ constexpr int kStageCount = 7;
 
 bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
                       bool readback_maps, CoarseResult& out, CoarseTiming* timing,
-                      std::string& err) {
+                      std::string& err, bool need_l0_response) {
     if (!ctx) {
         err = "null context";
         return false;
@@ -373,7 +373,7 @@ bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
         for (int id = 0; id < poses; ++id)
             out.response[1][size_t(id)].assign(
                 flat.begin() + size_t(id) * W1 * H1, flat.begin() + size_t(id + 1) * W1 * H1);
-        if (readback_maps) {
+        if (readback_maps && need_l0_response) {
             out.maps.w[1] = w1;
             out.maps.h[1] = h1;
             out.maps.angle[1].resize(size_t(w1) * h1);
@@ -404,7 +404,9 @@ bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
     mark_end(5);
 
     mark(6);
-    {
+    // 精益模式：跳过 L0 全图响应内核（宿主提取从 spread[0] 自算窗分）；
+    // 事件标记保留（timing 口径统一，elapsed≈0）
+    if (need_l0_response) {
         const dim3 grid((W0 * H0 + kBlockX - 1) / kBlockX, poses);
         if (vendor)
             k_sim_full<true><<<grid, kBlockX>>>(
@@ -422,24 +424,26 @@ bool run_coarse_chain(GpuContext* ctx, int poses, float weak, CoarseMode mode,
 
     out.resp_w[0] = W0;
     out.resp_h[0] = H0;
-    out.response[0].assign(size_t(poses), {});
-    {
+    if (need_l0_response) {
+        out.response[0].assign(size_t(poses), {});
         std::vector<uint16_t> flat(size_t(poses) * W0 * H0);
         CUDA_CHECK(cudaMemcpy(flat.data(), ctx->response, flat.size() * sizeof(uint16_t),
                               cudaMemcpyDeviceToHost));
         for (int id = 0; id < poses; ++id)
             out.response[0][size_t(id)].assign(
                 flat.begin() + size_t(id) * W0 * H0, flat.begin() + size_t(id + 1) * W0 * H0);
-        if (readback_maps) {
-            out.maps.w[0] = w;
-            out.maps.h[0] = h;
+    }
+    if (readback_maps) {
+        out.maps.w[0] = w;
+        out.maps.h[0] = h;
+        if (need_l0_response) {
             out.maps.angle[0].resize(size_t(w) * h);
-            out.maps.spread[0].resize(size_t(w) * h);
             CUDA_CHECK(cudaMemcpy(out.maps.angle[0].data(), L0.angle, size_t(w) * h,
                                   cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(out.maps.spread[0].data(), L0.spread, size_t(w) * h,
-                                  cudaMemcpyDeviceToHost));
         }
+        out.maps.spread[0].resize(size_t(w) * h);
+        CUDA_CHECK(cudaMemcpy(out.maps.spread[0].data(), L0.spread, size_t(w) * h,
+                              cudaMemcpyDeviceToHost));
     }
 
     if (timing) {

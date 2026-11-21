@@ -6,6 +6,10 @@
 #include "rescue_score.hpp"
 #include "coarse_image.hpp"
 
+#if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
+#include "gpu/coarse_service.hpp"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -189,6 +193,11 @@ std::vector<vf_shape_candidate> match_two_stage(
     std::vector<vf_shape_candidate> coarse_cands;
     // 异常穿透到 ABI boundary 报错：执行失败不得伪装成"无匹配"空结果
     coarse_cands = MatchProfile::measure(profile.coarse_ms, [&] {
+#if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
+        // 后端开关（VF_SHAPE_BACKEND，默认 cpu）；GPU 失败直报不回退
+        if (gpu::current_backend() == gpu::Backend::Gpu)
+            return gpu::match_coarse_gpu(*model.coarse, small, std::max(45.0, threshold - 20.0));
+#endif
         return match(*model.coarse, small, std::max(45.0, threshold - 20.0));
     });
     profile.coarse_candidates = int(coarse_cands.size());
