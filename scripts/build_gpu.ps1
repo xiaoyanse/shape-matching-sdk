@@ -77,7 +77,11 @@ function Invoke-Build([string]$buildDir, [string]$cudaOption) {
 }
 
 if ($Mode -in @('on', 'both')) {
-    Invoke-Build (Join-Path $repoRoot "build\$BuildName") 'ON'
+    $onDir = Join-Path $repoRoot "build\$BuildName"
+    Invoke-Build $onDir 'ON'
+    # 三代 fatbin 编译门（phase-0 §W5 本地化）：ON 构建后 cuobjdump 断言
+    # sm_86/89/120 三代 SASS 齐，缺席即失败（批次/发版门经本脚本自然覆盖）
+    & (Join-Path $repoRoot 'scripts\verify_fatbin.ps1') -Target (Join-Path $onDir 'visionforge_shape.dll') -CudaToolkitRoot $CudaToolkitRoot
 }
 if ($Mode -in @('off', 'both')) {
     Invoke-Build (Join-Path $repoRoot "build\$BuildName-off") 'OFF'
