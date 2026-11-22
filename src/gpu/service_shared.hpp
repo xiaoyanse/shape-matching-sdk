@@ -3,6 +3,7 @@
 // 双模型驻留槽（[0]=coarse/[1]=fine 窗，各自指纹失效判定）、帧槽容量制 ensure、
 // 失败编码错误直报。仅 src/gpu 服务层翻译单元包含，不进公共 ABI。
 #include "gpu_backend.hpp"
+#include "coarse_extract.hpp"
 
 #include "../error_code.hpp"
 
@@ -16,6 +17,31 @@ namespace vfshape::gpu {
 namespace svc {
 
 constexpr int kContextCandidates = 256;  // ≥W3 窗分分流阈值：免首窗批量触发重建
+
+// 两级金字塔宿主提取视图（粗层/精修窗服务同构复用，原两处匿名空间副本上提）
+inline bool build_extract_poses(const Model& model, ExtractPoses& poses, std::string& err) {
+    const int n = int(model.poses.size());
+    poses.class_id = "shape";
+    poses.level1.resize(size_t(n));
+    poses.level0.resize(size_t(n));
+    for (int id = 0; id < n; ++id) {
+        const auto& pyramid = model.detector.getTemplates("shape", id);
+        if (pyramid.size() != 2 || pyramid[0].pyramid_level != 0 ||
+            pyramid[1].pyramid_level != 1) {
+            err = "template pyramid layout mismatch";
+            return false;
+        }
+        for (int level = 0; level < 2; ++level) {
+            const auto& templ = pyramid[size_t(level)];
+            auto& dst = level == 1 ? poses.level1[size_t(id)] : poses.level0[size_t(id)];
+            dst.width = templ.width;
+            dst.height = templ.height;
+            dst.feats.reserve(templ.features.size());
+            for (const auto& f : templ.features) dst.feats.push_back({f.x, f.y, f.label});
+        }
+    }
+    return true;
+}
 
 struct SlotResidency {
     const void* model_id = nullptr;
@@ -144,11 +170,12 @@ inline void probe_device() {
     fb.gpu_usable.store(true, std::memory_order_release);
 }
 
-// 流水化管线（W3 波2 补完）：专用流 + frame_slot 交替分配 + 在途 job 计数。
-// 双工作面（face/response/centers/scores/fine 特征 ×2）使并发 job 设备写全隔离，
-// 发射无依赖链、end 各自同步自身事件；ensure_context 重建与在途 job 冲突时直报。
+// 流水化管线（W3 波2 补完 + W6 微波2 双流）：每 frame_slot 一条专用流（双流下
+// PARALLEL 双窗与预发射窗的链/内核/DMA 跨流真并行，D2H(copy engine) 与邻窗内核
+// 重叠）；双工作面使并发 job 设备写全隔离，发射无依赖链、end 各自同步自身事件；
+// ensure_context 重建与在途 job 冲突时直报。
 struct PipelineState {
-    void* stream = nullptr;
+    void* stream[2] = {nullptr, nullptr};
     bool stream_ready = false;
     bool slot_busy[2] = {false, false};  // 槽分配互斥下标记在途占用（双槽满=直报）
     std::atomic<int> active_jobs{0};

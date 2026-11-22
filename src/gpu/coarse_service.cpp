@@ -27,27 +27,7 @@ CoarseServiceStats& stats_slot() {
 }
 
 bool build_extract_poses(const Model& coarse, ExtractPoses& poses, std::string& err) {
-    const int n = int(coarse.poses.size());
-    poses.class_id = "shape";
-    poses.level1.resize(size_t(n));
-    poses.level0.resize(size_t(n));
-    for (int id = 0; id < n; ++id) {
-        const auto& pyramid = coarse.detector.getTemplates("shape", id);
-        if (pyramid.size() != 2 || pyramid[0].pyramid_level != 0 ||
-            pyramid[1].pyramid_level != 1) {
-            err = "template pyramid layout mismatch";
-            return false;
-        }
-        for (int level = 0; level < 2; ++level) {
-            const auto& templ = pyramid[size_t(level)];
-            auto& dst = level == 1 ? poses.level1[size_t(id)] : poses.level0[size_t(id)];
-            dst.width = templ.width;
-            dst.height = templ.height;
-            dst.feats.reserve(templ.features.size());
-            for (const auto& f : templ.features) dst.feats.push_back({f.x, f.y, f.label});
-        }
-    }
-    return true;
+    return svc::build_extract_poses(coarse, poses, err);
 }
 
 // matcher.cpp 匿名空间同名实现不可达，最小平移（两处需同步改）

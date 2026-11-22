@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,6 +35,11 @@ FineWindowStats& stats_slot() {
     static FineWindowStats value;
     return value;
 }
+
+// 逐窗环形（W6 先决量化）：与 stats_slot 同锁同写入点
+FineWindowStats g_stats_ring[16];
+int g_stats_ring_total = 0;
+int g_stats_ring_base = 0;
 
 std::mutex& stats_mutex() {
     static std::mutex value;
@@ -64,30 +71,6 @@ bool ensure_pinned(uint16_t** ptr, size_t* cap, size_t bytes, std::string& err) 
     return true;
 }
 
-bool build_extract_poses(const Model& fine, ExtractPoses& poses, std::string& err) {
-    const int n = int(fine.poses.size());
-    poses.class_id = "shape";
-    poses.level1.resize(size_t(n));
-    poses.level0.resize(size_t(n));
-    for (int id = 0; id < n; ++id) {
-        const auto& pyramid = fine.detector.getTemplates("shape", id);
-        if (pyramid.size() != 2 || pyramid[0].pyramid_level != 0 ||
-            pyramid[1].pyramid_level != 1) {
-            err = "template pyramid layout mismatch";
-            return false;
-        }
-        for (int level = 0; level < 2; ++level) {
-            const auto& templ = pyramid[size_t(level)];
-            auto& dst = level == 1 ? poses.level1[size_t(id)] : poses.level0[size_t(id)];
-            dst.width = templ.width;
-            dst.height = templ.height;
-            dst.feats.reserve(templ.features.size());
-            for (const auto& f : templ.features) dst.feats.push_back({f.x, f.y, f.label});
-        }
-    }
-    return true;
-}
-
 // —— 发射段实体：事件 RAII + 在途/槽占用计数回收 ——
 struct FineJob {
     int fs = 0;
@@ -109,6 +92,13 @@ struct FineJob {
     void* e_d2h = nullptr;
 
     ~FineJob() {
+        // 作废路径（预发射残留析构）可能在异步 H2D 仍在流内排队时释放 padded
+        // 源——e_resp1 位于 H2D 之后，同步它保证 H2D 完成再析构；正常路径已
+        // 同步过，此处幂等
+        if (e_resp1) {
+            std::string sync_err;
+            event_sync(e_resp1, sync_err);
+        }
         event_destroy(e_chain_begin);
         event_destroy(e_resp1);
         event_destroy(e_chain_end);
@@ -136,10 +126,90 @@ bool create_job_events(FineJob& job, std::string& err) {
     return job.e_d2h != nullptr;
 }
 
+// 预发射槽（W6 窗批合并）：单槽缓存待领 job；领取/覆盖/作废均在 service_mutex
+// 内交接，旧 job 析构（持同锁清槽占用）移出锁外，防递归死锁
+struct PrefetchSlot {
+    uint64_t key = 0;
+    const void* model = nullptr;
+    std::unique_ptr<FineJob> job;
+};
+
+PrefetchSlot& prefetch_slot() {
+    static PrefetchSlot value;
+    return value;
+}
+
+// 作废残留：job move 出锁外析构（发射产物白跑无害，槽占用即时回收）
+void discard_prefetch_locked(PrefetchSlot& slot, std::unique_ptr<FineJob>& stale_sink) {
+    if (slot.job) {
+        stale_sink = std::move(slot.job);
+        slot.key = 0;
+        slot.model = nullptr;
+    }
+}
+
 }  // namespace
+
+static std::unique_ptr<FineJob> fine_window_begin(Model& fine, const cv::Mat& window,
+                                                  double fine_th);
+static std::vector<vf_shape_candidate> fine_window_end(std::unique_ptr<FineJob> job, Model& fine,
+                                                       const cv::Mat& window, double fine_th);
+
+bool window_prefetch_enabled() {
+    const char* value = std::getenv("VF_SHAPE_WINDOW_PREFETCH");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+bool window_streams_enabled() {
+    const char* value = std::getenv("VF_SHAPE_WINDOW_STREAMS");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+// frame_slot → 流：开关开=各槽专用流（DMA/SM 跨引擎+跨窗重叠）；关=单流
+//（回 W5+微波1 终态排序）
+void* stream_for(int fs) {
+    svc::PipelineState& pipe = svc::pipeline();
+    return window_streams_enabled() ? pipe.stream[fs] : pipe.stream[0];
+}
+
+bool fine_prefetch(Model& fine, const cv::Mat& window, double fine_th, uint64_t prefetch_key) {
+    if (!window_prefetch_enabled() || prefetch_key == 0) return false;
+    std::unique_ptr<FineJob> job;
+    try {
+        job = fine_window_begin(fine, window, fine_th);
+    } catch (...) {
+        return false;  // 投机路径失败静默降级（主流程同步发射语义不变）
+    }
+    std::unique_ptr<FineJob> stale;
+    {
+        std::lock_guard<std::mutex> lock(svc::service_mutex());
+        discard_prefetch_locked(prefetch_slot(), stale);
+        prefetch_slot().key = prefetch_key;
+        prefetch_slot().model = &fine;
+        prefetch_slot().job = std::move(job);
+    }
+    return true;
+}
 
 const FineWindowStats& last_fine_stats() {
     return stats_slot();
+}
+
+int fine_stats_since(FineWindowStats* out, int cap) {
+    std::lock_guard<std::mutex> lock(stats_mutex());
+    const int total = g_stats_ring_total;
+    const int available = std::min(total - g_stats_ring_base, 16);
+    const int n = std::min(available, cap);
+    for (int i = 0; i < n; ++i) {
+        const int idx = (total - n + i + 160000) % 16;
+        out[i] = g_stats_ring[size_t(idx)];
+    }
+    return n;
+}
+
+void fine_stats_ring_reset() {
+    std::lock_guard<std::mutex> lock(stats_mutex());
+    g_stats_ring_base = g_stats_ring_total;
 }
 
 // 发射段：校验/指纹/上下文/槽分配（service_mutex 短临界）→ H2D/驻留/链路发射入
@@ -161,8 +231,10 @@ static std::unique_ptr<FineJob> fine_window_begin(Model& fine, const cv::Mat& wi
         if (!svc::ensure_context(pw, ph, fp.poses, fp.features, err)) svc::gpu_fail(err);
         svc::PipelineState& pipe = svc::pipeline();
         if (!pipe.stream_ready) {
-            pipe.stream = stream_create(err);
-            if (!pipe.stream) svc::gpu_fail(err);
+            for (int fs = 0; fs < 2; ++fs) {
+                pipe.stream[fs] = stream_create(err);
+                if (!pipe.stream[fs]) svc::gpu_fail(err);
+            }
             pipe.stream_ready = true;
         }
         if (pipe.slot_busy[0] && pipe.slot_busy[1])
@@ -184,11 +256,11 @@ static std::unique_ptr<FineJob> fine_window_begin(Model& fine, const cv::Mat& wi
     if (!ensure_pinned(&pl.resp1, &pl.resp1_cap, job->resp1_bytes, err)) svc::gpu_fail(err);
     job->resp1_pinned = pl.resp1;
     if (!upload_frame_capacity_async(svc::state().ctx, job->padded.data, pw, ph,
-                                     svc::pipeline().stream, err, job->fs))
+                                     stream_for(job->fs), err, job->fs))
         svc::gpu_fail(err);
     if (svc::consume_chain_fail_hook()) svc::gpu_fail("injected chain failure");
     if (!run_coarse_chain_async(svc::state().ctx, fp.poses, fine.detector.tuned_weak,
-                                svc::pipeline().stream, job->resp1_pinned, job->resp1_bytes,
+                                stream_for(job->fs), job->resp1_pinned, job->resp1_bytes,
                                 job->resp_w1, job->resp_h1, &job->spread0_dev, job->sw,
                                 job->sh, job->e_chain_begin, job->e_resp1, job->e_chain_end,
                                 /*model_slot=*/1, job->fs, err))
@@ -203,7 +275,7 @@ static std::vector<vf_shape_candidate> fine_window_end(std::unique_ptr<FineJob> 
                                                        double fine_th) {
     std::string err;
     ExtractPoses extract_poses;
-    if (!build_extract_poses(fine, extract_poses, err)) svc::gpu_fail(err);
+    if (!svc::build_extract_poses(fine, extract_poses, err)) svc::gpu_fail(err);
 
     const auto scan_t0 = std::chrono::steady_clock::now();
     if (!event_sync(job->e_resp1, err)) svc::gpu_fail(err);
@@ -247,8 +319,7 @@ static std::vector<vf_shape_candidate> fine_window_end(std::unique_ptr<FineJob> 
                                          context_pose_capacity(svc::state().ctx),
                                          wc.data() + begin, cp.data() + begin, n,
                                          job->scores_pinned, job->scores_bytes, job->e_k0,
-                                         job->e_k1, job->e_d2h, 1, svc::pipeline().stream,
-                                         err,
+                                         job->e_k1, job->e_d2h, 1, stream_for(job->fs), err,
                                          job->fs))
                 svc::gpu_fail(err);
             if (!event_sync(job->e_d2h, err)) svc::gpu_fail(err);
@@ -286,6 +357,8 @@ static std::vector<vf_shape_candidate> fine_window_end(std::unique_ptr<FineJob> 
         stats.scores_d2h_ms = d2h_ms;
         stats.initial_count = int(cands.size());
         stats.window_kernel_used = kernel_path ? 1 : 0;
+        g_stats_ring[size_t(g_stats_ring_total % 16)] = stats;
+        ++g_stats_ring_total;
     }
 
     PreparedFrame frame;  // 收尾只消费窗口宽高（center 越界过滤），features 留空
@@ -297,10 +370,22 @@ static std::vector<vf_shape_candidate> fine_window_end(std::unique_ptr<FineJob> 
 }
 
 std::vector<vf_shape_candidate> match_fine_window_gpu(Model& fine, const cv::Mat& window,
-                                                      double fine_th) {
+                                                      double fine_th, uint64_t prefetch_key) {
     require_coded(std::isfinite(fine_th) && fine_th > 0 && fine_th <= 100,
                   VF_SHAPE_THRESHOLD_INVALID, "invalid similarity threshold", fine_th);
-    auto job = fine_window_begin(fine, window, fine_th);
+    std::unique_ptr<FineJob> job;
+    std::unique_ptr<FineJob> stale;
+    {
+        std::lock_guard<std::mutex> lock(svc::service_mutex());
+        PrefetchSlot& slot = prefetch_slot();
+        if (window_prefetch_enabled() && prefetch_key != 0 && slot.job && slot.key == prefetch_key &&
+            slot.model == &fine) {
+            job = std::move(slot.job);  // 命中领取：沿用预发射工作面与发射序
+        }
+        discard_prefetch_locked(slot, stale);  // 未命中/无 key：残留作废
+    }
+    stale.reset();
+    if (!job) job = fine_window_begin(fine, window, fine_th);
     return fine_window_end(std::move(job), fine, window, fine_th);
 }
 

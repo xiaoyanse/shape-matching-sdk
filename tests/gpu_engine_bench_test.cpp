@@ -108,6 +108,30 @@ void part_window_gate(vfshape::TwoStageModel& model, const cv::Mat& patch) {
                 stats.window_kernel_used);
     std::printf("[bench] memo coarse_resize cpu=%7.3fms gpu=%7.3fms (excl)\n",
                 cpu.coarse_resize_ms, gpu.coarse_resize_ms);
+    // —— 逐窗分列（W6 微波2 先决量化）：稳态单轮六字段 + GPU/宿主占比汇总 ——
+    vfshape::gpu::fine_stats_ring_reset();
+    set_backend("gpu");
+    (void)vfshape::match_two_stage(model, scene, kThreshold, 16);
+    vfshape::gpu::FineWindowStats rows[16];
+    const int rows_n = vfshape::gpu::fine_stats_since(rows, 16);
+    double gpu_side_total = 0, cpu_side_total = 0;
+    for (int i = 0; i < rows_n; ++i) {
+        const double gpu_side =
+            rows[i].chain_ms + rows[i].window_kernel_ms + rows[i].scores_d2h_ms;
+        const double cpu_side = rows[i].initial_scan_ms + rows[i].extract_ms;
+        gpu_side_total += gpu_side;
+        cpu_side_total += cpu_side;
+        std::printf("[memo-row] win%d chain=%6.3f scan=%6.3f kernel=%6.3f d2h=%6.3f "
+                    "extract=%6.3f initial=%5d gpu_side=%6.3f cpu_side=%6.3f\n",
+                    i, rows[i].chain_ms, rows[i].initial_scan_ms, rows[i].window_kernel_ms,
+                    rows[i].scores_d2h_ms, rows[i].extract_ms, rows[i].initial_count, gpu_side,
+                    cpu_side);
+    }
+    std::printf("[memo-sum] windows=%d gpu_side=%.3fms cpu_side=%.3fms gpu_share=%.1f%%\n",
+                rows_n, gpu_side_total, cpu_side_total,
+                gpu_side_total + cpu_side_total > 0
+                    ? 100.0 * gpu_side_total / (gpu_side_total + cpu_side_total)
+                    : 0.0);
     check(speedup >= kGate,
           "window segment speedup below gate: " + std::to_string(speedup));
 }

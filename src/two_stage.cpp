@@ -75,29 +75,71 @@ std::vector<vf_shape_candidate> match_two_stage_run(
         MatchProfile::Window& trace_window =
             ci < profile.windows.size() ? profile.windows[ci] : overflow_trace;
         std::vector<vf_shape_candidate> window_results;
-        const auto& cc = coarse_cands[ci];
-        const double cx = cc.center[0] * model.k, cy = cc.center[1] * model.k;
-        double cs = (cc.scale > 0) ? cc.scale : 1.0;
-        double ca = cc.angle;
-        if (ca > 180) ca -= 360;
-        const GroupSpec* spec = nullptr;
-        const Model* fine_model = fine_for_angle(model, ca, &spec);
+        // 窗口推导单一实现（主路径与 W6 预发射共用，同输入必同输出=预发射位级前提）
+        struct DerivedWindow {
+            bool valid = false;
+            double cs = 1.0, ca = 0.0;
+            const Model* fine = nullptr;
+            const GroupSpec* spec = nullptr;
+            int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+            bool needs_scale = false;
+            cv::Mat window, window_scaled;
+        };
+        auto derive_window = [&](size_t wi, MatchProfile::Window* trace) {
+            DerivedWindow d;
+            const auto& cc = coarse_cands[wi];
+            d.cs = (cc.scale > 0) ? cc.scale : 1.0;
+            d.ca = cc.angle;
+            if (d.ca > 180) d.ca -= 360;
+            d.fine = fine_for_angle(model, d.ca, &d.spec);
+            const double half = fine_half * std::max(1.0, d.cs);
+            d.x0 = int(std::max(0.0, cc.center[0] * model.k - half));
+            d.y0 = int(std::max(0.0, cc.center[1] * model.k - half));
+            d.x1 = int(std::min(double(w), d.x0 + 2 * half));
+            d.y1 = int(std::min(double(h), d.y0 + 2 * half));
+            if (d.x1 - d.x0 < 24 || d.y1 - d.y0 < 24) return d;
+            d.window = image_bgr(cv::Rect(d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0));
+            d.window_scaled = d.window;
+            d.needs_scale = std::abs(d.cs - 1.0) > 0.02;
+            if (d.needs_scale) {
+                if (trace) {
+                    MatchProfile::Timer resize_timer(trace->resize_ms);
+                    d.window_scaled = scale_fine_window(d.window, d.cs);
+                } else {
+                    d.window_scaled = scale_fine_window(d.window, d.cs);
+                }
+            }
+            d.valid = true;
+            return d;
+        };
+#if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
+        auto prefetch_key = [](const Model& m, const DerivedWindow& d, double th) {
+            uint64_t h = 1469598103934665603ull;
+            auto mix = [&h](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+            uint64_t cs_bits = 0, th_bits = 0;
+            std::memcpy(&cs_bits, &d.cs, sizeof(cs_bits));
+            std::memcpy(&th_bits, &th, sizeof(th_bits));
+            mix(uintptr_t(&m));
+            mix(uint64_t(unsigned(d.x0)));
+            mix(uint64_t(unsigned(d.y0)));
+            mix(uint64_t(unsigned(d.x1)));
+            mix(uint64_t(unsigned(d.y1)));
+            mix(cs_bits);
+            mix(th_bits);
+            return h;
+        };
+#endif
+        const DerivedWindow dw = derive_window(ci, &trace_window);
+        if (!dw.valid) return window_results;
+        double cs = dw.cs;
+        const GroupSpec* spec = dw.spec;
+        const Model* fine_model = dw.fine;
+        trace_window.width = dw.x1 - dw.x0; trace_window.height = dw.y1 - dw.y0;
+        trace_window.scale = dw.cs; trace_window.angle = dw.ca;
+        const cv::Mat& window = dw.window;
 
-        const double half = fine_half * std::max(1.0, cs);
-        const int x0 = int(std::max(0.0, cx - half)), y0 = int(std::max(0.0, cy - half));
-        const int x1 = int(std::min(double(w), x0 + 2 * half));
-        const int y1 = int(std::min(double(h), y0 + 2 * half));
-        if (x1 - x0 < 24 || y1 - y0 < 24) return window_results;
-        trace_window.width = x1 - x0; trace_window.height = y1 - y0;
-        trace_window.scale = cs; trace_window.angle = ca;
-        cv::Mat window = image_bgr(cv::Rect(x0, y0, x1 - x0, y1 - y0));
-
-        cv::Mat window_scaled = window;
-        const bool needs_scale = std::abs(cs - 1.0) > 0.02;
-        if (needs_scale) {
-            MatchProfile::Timer resize_timer(trace_window.resize_ms);
-            window_scaled = scale_fine_window(window, cs);
-        }
+        const cv::Mat& window_scaled = dw.window_scaled;
+        const bool needs_scale = dw.needs_scale;
         cv::Mat effective = window_scaled;
         std::vector<vf_shape_candidate> refined;
         // 精修异常穿透（含并行窗 future.get 重抛）：失败窗口不得静默产出空结果
@@ -112,12 +154,13 @@ std::vector<vf_shape_candidate> match_two_stage_run(
                 return prepare_frame(image, &fine_model->detector);
             });
         };
-        auto evaluate = [&](Model& m, const PreparedFrame& frame, const cv::Mat& gpu_image) {
+        auto evaluate = [&](Model& m, const PreparedFrame& frame, const cv::Mat& gpu_image,
+                            uint64_t pkey) {
 #if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
             // GPU 路径：vendor PreparedFrame 不参与，全窗墙钟记 match_ms
             if (gpu_seam)
                 return MatchProfile::measure(trace_window.match_ms, [&] {
-                    return gpu::match_fine_window_gpu(m, gpu_image, fine_th);
+                    return gpu::match_fine_window_gpu(m, gpu_image, fine_th, pkey);
                 });
 #endif
             const int ready = frame.features.preparedLevels();
@@ -131,12 +174,17 @@ std::vector<vf_shape_candidate> match_two_stage_run(
         bool selected_uses_prepared = !gpu_seam;
         PreparedFrame prepared;
         if (!gpu_seam) prepared = prepare(window_scaled);
-        refined = evaluate(*selected, prepared, window_scaled);
+#if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
+        const uint64_t own_key = prefetch_key(*fine_model, dw, fine_th);
+#else
+        const uint64_t own_key = 0;
+#endif
+        refined = evaluate(*selected, prepared, window_scaled, own_key);
         if (best_score(refined) < threshold && needs_scale) {
             ++trace_window.scale_retries;
             PreparedFrame retry_frame;
             if (!gpu_seam) retry_frame = prepare(window);
-            auto retry = evaluate(*selected, retry_frame, window);
+            auto retry = evaluate(*selected, retry_frame, window, 0);
             if (best_score(retry) > best_score(refined)) {
                 cs = 1.0;
                 effective = window;
@@ -157,8 +205,8 @@ std::vector<vf_shape_candidate> match_two_stage_run(
                 std::vector<vf_shape_candidate> retry;
                 if (reuse || gpu_seam) {
                     // GPU 路径 prepared 无意义：两分支统一走 GPU 直调 alternate
-                    //（同窗帧驻留复用，等价性论证见 W3 波2 报告）
-                    retry = evaluate(alternate, prepared, effective);
+                    //（同窗帧驻留复用，等价性论证见 W3 波2 报告；重试不领预发射）
+                    retry = evaluate(alternate, prepared, effective, 0);
                 } else {
                     retry = match(alternate, effective, fine_th);
                 }
@@ -173,13 +221,13 @@ std::vector<vf_shape_candidate> match_two_stage_run(
         profile.window_best[ci] = best_score(refined);
         bool eligible = can_rescue && profile.window_best[ci] < threshold;
         for (auto& r : refined) {
-            reproject_candidate(r, x0, y0, *spec, cs);
+            reproject_candidate(r, dw.x0, dw.y0, *spec, cs);
             if (r.pose_ambiguous || r.center[0] < 0 || r.center[1] < 0) eligible = false;
             window_results.push_back(r);
         }
         if (eligible) {
             auto& miss = misses[ci];
-            miss = {selected, spec, window, std::nullopt, x0, y0, cs, refined.empty(),
+            miss = {selected, spec, window, std::nullopt, dw.x0, dw.y0, cs, refined.empty(),
                     std::abs(cs - 1.0) > 0.02};
             if (selected_uses_prepared && ci < kMaxCachedRescueWindows &&
                 size_t(prepared.padded_width) * prepared.padded_height <= kMaxCachedRescuePixels) {
@@ -188,6 +236,21 @@ std::vector<vf_shape_candidate> match_two_stage_run(
                 miss.prepared.emplace(std::move(prepared));
             }
         }
+#if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
+        // W6 窗批合并：预发射下一窗（H2D+全链入流，单槽待领）。决策序零改动——
+        // 早停不跑则发射产物作废复用面；PARALLEL 构建下窗 1 由 async 线程自理
+        //（本点预发射白跑反优化），仅串行段（ci>=1）预发。单窗内发射序不变。
+        if (gpu_seam && ci + 1 < use && gpu::window_prefetch_enabled()
+#if defined(VF_SHAPE_PARALLEL_WINDOWS) && VF_SHAPE_PARALLEL_WINDOWS
+            && ci >= 1
+#endif
+        ) {
+            const DerivedWindow nd = derive_window(ci + 1, nullptr);
+            if (nd.valid)
+                gpu::fine_prefetch(*const_cast<Model*>(nd.fine), nd.window_scaled, fine_th,
+                                   prefetch_key(*nd.fine, nd, fine_th));
+        }
+#endif
         return window_results;
     };
     std::vector<vf_shape_candidate> results;

@@ -49,8 +49,10 @@ void reset_gpu_state() {
     gpu::destroy_context(gpu::svc::state().ctx);
     gpu::svc::state() = gpu::svc::ServiceState{};
     gpu::svc::PipelineState& pipe = gpu::svc::pipeline();
-    if (pipe.stream_ready) gpu::stream_destroy(pipe.stream);
-    pipe.stream = nullptr;
+    for (int fs = 0; fs < 2; ++fs)
+        if (pipe.stream[fs]) gpu::stream_destroy(pipe.stream[fs]);
+    pipe.stream[0] = nullptr;
+    pipe.stream[1] = nullptr;
     pipe.stream_ready = false;
     pipe.slot_busy[0] = pipe.slot_busy[1] = false;
     pipe.active_jobs.store(0);
