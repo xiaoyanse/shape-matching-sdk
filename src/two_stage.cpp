@@ -17,16 +17,18 @@
 #include <cmath>
 #include <future>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace vfshape {
 
-// —— 两级匹配（Python TwoStageMatcher._match_locked 对齐）——
-std::vector<vf_shape_candidate> match_two_stage(
+namespace {
+
+// gpu_seam=true 时两级接缝全走 GPU 服务（入口一次决策，整调用同后端）；GPU 路径
+// 失败由 match_two_stage 包装层捕获回退
+std::vector<vf_shape_candidate> match_two_stage_run(
     TwoStageModel& model, const cv::Mat& image_bgr, double threshold, int max_candidates,
-    MatchTraceSnapshot* trace) {
-    require_coded(std::isfinite(threshold) && threshold > 0 && threshold <= 100,
-                  VF_SHAPE_THRESHOLD_INVALID, "invalid similarity threshold", threshold);
+    MatchTraceSnapshot* trace, bool gpu_seam) {
     MatchProfile profile;
     const int w = image_bgr.cols, h = image_bgr.rows;
     // 粗层：1/k 缩图（4096 接口限制在编排内自然放开——缩图与窗口均小）
@@ -38,8 +40,7 @@ std::vector<vf_shape_candidate> match_two_stage(
     // 异常穿透到 ABI boundary 报错：执行失败不得伪装成"无匹配"空结果
     coarse_cands = MatchProfile::measure(profile.coarse_ms, [&] {
 #if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
-        // 后端开关（VF_SHAPE_BACKEND，默认 cpu）；GPU 失败直报不回退
-        if (gpu::current_backend() == gpu::Backend::Gpu)
+        if (gpu_seam)
             return gpu::match_coarse_gpu(*model.coarse, small, std::max(45.0, threshold - 20.0));
 #endif
         return match(*model.coarse, small, std::max(45.0, threshold - 20.0));
@@ -105,11 +106,6 @@ std::vector<vf_shape_candidate> match_two_stage(
             for (const auto& candidate : candidates) score = std::max(score, candidate.score);
             return score;
         };
-#if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
-        const bool gpu_seam = gpu::current_backend() == gpu::Backend::Gpu;
-#else
-        constexpr bool gpu_seam = false;
-#endif
         auto prepare = [&](const cv::Mat& image) {
             ++trace_window.prepares;
             return MatchProfile::measure(trace_window.prepare_ms, [&] {
@@ -246,6 +242,43 @@ std::vector<vf_shape_candidate> match_two_stage(
     profile.final_candidates = int(results.size());
     if (trace) *trace = profile.snapshot();
     return results;
+}
+
+}  // namespace
+
+// —— 两级匹配（Python TwoStageMatcher._match_locked 对齐）——
+// auto 态（W4 默认）：GPU 路径任一步编码错误 → 连续失败计数+1 并整调用 CPU 重跑
+//（输入纯函数幂等，W3 已证逐位等价），不向调用方报错；连续 3 次失败转粘性禁用
+// 至进程结束。gpu 态失败直报（对拍语义不变），cpu 态不触 GPU。
+std::vector<vf_shape_candidate> match_two_stage(
+    TwoStageModel& model, const cv::Mat& image_bgr, double threshold, int max_candidates,
+    MatchTraceSnapshot* trace) {
+    require_coded(std::isfinite(threshold) && threshold > 0 && threshold <= 100,
+                  VF_SHAPE_THRESHOLD_INVALID, "invalid similarity threshold", threshold);
+#if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
+    const gpu::Backend mode = gpu::current_backend();
+    if (mode == gpu::Backend::Auto) {
+        if (gpu::resolve_backend() == gpu::Backend::Gpu) {
+            try {
+                auto results = match_two_stage_run(model, image_bgr, threshold, max_candidates,
+                                                   trace, true);
+                gpu::note_gpu_call_ok();
+                return results;
+            } catch (const std::invalid_argument&) {
+                // 仅 GPU 故障类（INTERNAL）计失败并回退；输入性编码错误（搜索
+                // 预算等同码同参在 CPU 路径必然同样抛出）直抛调用方，不计数
+                // ——否则连续无效输入会粘性禁用 GPU（语义错误）
+                if (g_last_error.code != int32_t(VF_SHAPE_INTERNAL)) throw;
+                gpu::note_gpu_call_failed();
+                return match_two_stage_run(model, image_bgr, threshold, max_candidates, trace,
+                                           false);
+            }
+        }
+    } else if (mode == gpu::Backend::Gpu) {
+        return match_two_stage_run(model, image_bgr, threshold, max_candidates, trace, true);
+    }
+#endif
+    return match_two_stage_run(model, image_bgr, threshold, max_candidates, trace, false);
 }
 
 }  // namespace vfshape

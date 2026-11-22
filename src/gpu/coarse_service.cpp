@@ -81,7 +81,29 @@ vf_shape_candidate candidate(const Model& model, const line2Dup::Match& hit, int
 
 Backend current_backend() {
     const char* value = std::getenv("VF_SHAPE_BACKEND");
-    return value != nullptr && std::strcmp(value, "gpu") == 0 ? Backend::Gpu : Backend::Cpu;
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "auto") == 0)
+        return Backend::Auto;
+    return std::strcmp(value, "gpu") == 0 ? Backend::Gpu : Backend::Cpu;
+}
+
+Backend resolve_backend() {
+    const Backend mode = current_backend();
+    if (mode != Backend::Auto) return mode;
+    svc::FallbackState& fb = svc::fallback();
+    if (fb.sticky_disabled.load(std::memory_order_acquire)) return Backend::Cpu;
+    if (!fb.probed.load(std::memory_order_acquire)) svc::probe_device();
+    return fb.gpu_usable.load(std::memory_order_acquire) ? Backend::Gpu : Backend::Cpu;
+}
+
+void note_gpu_call_ok() {
+    svc::fallback().chain_fail_streak.store(0, std::memory_order_relaxed);
+}
+
+void note_gpu_call_failed() {
+    svc::FallbackState& fb = svc::fallback();
+    const int streak = fb.chain_fail_streak.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (streak >= 3 && !fb.sticky_disabled.exchange(true, std::memory_order_acq_rel))
+        svc::gpu_log("vfshape: gpu fallback (sticky disable: 3 consecutive runtime failures)");
 }
 
 const CoarseServiceStats& last_call_stats() {
@@ -108,6 +130,7 @@ std::vector<vf_shape_candidate> match_coarse_gpu(Model& coarse, const cv::Mat& s
 
     CoarseResult result;
     CoarseTiming timing;
+    if (svc::consume_chain_fail_hook()) svc::gpu_fail("injected chain failure");
     // 精益模式：提取只消费 response[1]+spread[0]，跳过 L0 全图响应与冗余回读
     if (!run_coarse_chain(svc::state().ctx, fp.poses, coarse.detector.tuned_weak,
                           CoarseMode::VendorExact, true, result, &timing, err,

@@ -186,6 +186,7 @@ static std::unique_ptr<FineJob> fine_window_begin(Model& fine, const cv::Mat& wi
     if (!upload_frame_capacity_async(svc::state().ctx, job->padded.data, pw, ph,
                                      svc::pipeline().stream, err, job->fs))
         svc::gpu_fail(err);
+    if (svc::consume_chain_fail_hook()) svc::gpu_fail("injected chain failure");
     if (!run_coarse_chain_async(svc::state().ctx, fp.poses, fine.detector.tuned_weak,
                                 svc::pipeline().stream, job->resp1_pinned, job->resp1_bytes,
                                 job->resp_w1, job->resp_h1, &job->spread0_dev, job->sw,
@@ -241,6 +242,7 @@ static std::vector<vf_shape_candidate> fine_window_end(std::unique_ptr<FineJob> 
             if (!ensure_pinned(&pl.scores, &pl.scores_cap, job->scores_bytes, err))
                 svc::gpu_fail(err);
             job->scores_pinned = pl.scores;
+            if (svc::consume_chain_fail_hook()) svc::gpu_fail("injected chain failure");
             if (!run_window_scores_async(svc::state().ctx, nullptr, job->pw, job->ph,
                                          context_pose_capacity(svc::state().ctx),
                                          wc.data() + begin, cp.data() + begin, n,

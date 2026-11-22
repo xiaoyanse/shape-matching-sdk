@@ -82,6 +82,21 @@ if ($SkipAssemble) {
 }
 New-Item -ItemType Directory -Force $runtimeDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $buildDir 'visionforge_shape.dll') -Destination $runtimeDir -Force
+# W4 PE 导入预验（弹窗红线，装到即验）：静态 cudart 自包含应无 CUDA 运行时 DLL
+# 依赖，nvcuda 延迟加载。python/py 启动器都不在 PATH 时跳过并警告（装配机不强制
+# 装 python），预验失败=装配失败。
+$peScript = Join-Path $sourceDir 'benchmarks/gpu-spike/scripts/pe_imports.py'
+$pythonLauncher = @('python', 'py') |
+    ForEach-Object { Get-Command $_ -ErrorAction SilentlyContinue } |
+    Select-Object -First 1
+if ($pythonLauncher) {
+    & $pythonLauncher.Source $peScript (Join-Path $runtimeDir 'visionforge_shape.dll') | Write-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "PE 导入预验失败：visionforge_shape.dll 存在不可解析导入（退出码 $LASTEXITCODE），禁止分发"
+    }
+} else {
+    Write-Warning 'PE 导入预验跳过：PATH 中未找到 python/py 启动器'
+}
 $opencvLibraries = @(Get-ChildItem -LiteralPath "$OpenCvRoot/bin" -Filter 'opencv_world*.dll' |
     Where-Object { $_.Name -notmatch 'd\.dll$' })
 if ($opencvLibraries.Count -ne 1) { throw '需要唯一 Release opencv_world DLL' }

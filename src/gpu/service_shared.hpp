@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <mutex>
 #include <string>
 
@@ -38,6 +39,109 @@ inline ServiceState& state() {
 inline std::mutex& service_mutex() {
     static std::mutex value;
     return value;
+}
+
+// —— W4 回退兜底状态面（进程级，粗精两服务共享；不进公共 ABI）——
+
+// 日志 sink 可注入（测试捕获）；缺省 stderr 单行，消息自带 "vfshape: " 前缀
+using GpuLogSink = void (*)(const char*);
+
+inline GpuLogSink& log_sink() {
+    static GpuLogSink value = nullptr;
+    return value;
+}
+
+inline void gpu_log(const char* message) {
+    if (const GpuLogSink sink = log_sink()) sink(message);
+    else std::fprintf(stderr, "%s\n", message);
+}
+
+// 测试失败注入（仅测试目标置位；原子面为并行窗并发扣减所需）
+struct TestHooks {
+    int inject_probe_fail_branch = 0;       // 1/2/3 = probe 三分支注入
+    int inject_init_fail = 0;               // 首次上下文创建注入失败次数（互斥内扣减）
+    std::atomic<int> inject_chain_fail{0};  // 链路调用点注入失败次数
+};
+
+inline TestHooks& test_hooks() {
+    static TestHooks value;
+    return value;
+}
+
+// 探测/回退粘性状态：探测结论与粘性禁用存续至进程结束，运行中失败按
+// 连续计数（成功调用清零），两次字段读写跨线程，故用原子
+struct FallbackState {
+    std::atomic<bool> probed{false};
+    std::atomic<bool> gpu_usable{false};
+    std::atomic<int> chain_fail_streak{0};
+    std::atomic<bool> sticky_disabled{false};
+};
+
+inline FallbackState& fallback() {
+    static FallbackState value;
+    return value;
+}
+
+inline int consume_probe_fail_branch() {
+    const int branch = test_hooks().inject_probe_fail_branch;
+    test_hooks().inject_probe_fail_branch = 0;
+    return branch;
+}
+
+inline bool consume_init_fail_hook() {
+    int& remaining = test_hooks().inject_init_fail;
+    if (remaining <= 0) return false;
+    --remaining;
+    return true;
+}
+
+inline bool consume_chain_fail_hook() {
+    std::atomic<int>& remaining = test_hooks().inject_chain_fail;
+    int current = remaining.load(std::memory_order_acquire);
+    while (current > 0 &&
+           !remaining.compare_exchange_weak(current, current - 1, std::memory_order_acq_rel)) {
+    }
+    return current > 0;
+}
+
+// 三分支设备探测（进程内一次，粘性）：无卡/驱动缺、算力集外、上下文初始化
+// 失败 → 永久 CPU + stderr 单行注明原因。env=cpu 时调用方旁路本函数
+inline void probe_device() {
+    FallbackState& fb = fallback();
+    std::lock_guard<std::mutex> lock(service_mutex());
+    if (fb.probed.load(std::memory_order_acquire)) return;
+    fb.probed.store(true, std::memory_order_release);
+    if (const int branch = consume_probe_fail_branch()) {
+        const char* reason = branch == 1 ? "no cuda device: injected probe failure"
+            : branch == 2 ? "sm_00 outside supported set {86,89,120}: injected probe failure"
+                          : "context init failed: injected probe failure";
+        char line[128];
+        std::snprintf(line, sizeof line, "vfshape: gpu fallback (%s)", reason);
+        gpu_log(line);
+        return;
+    }
+    std::string name, err;
+    int major = 0, minor = 0;
+    if (!device_info(name, major, minor, err)) {
+        gpu_log(("vfshape: gpu fallback (no cuda device: " + err + ")").c_str());
+        return;
+    }
+    const int sm = major * 10 + minor;
+    if (sm != 86 && sm != 89 && sm != 120) {
+        char line[96];
+        std::snprintf(line, sizeof line,
+                      "vfshape: gpu fallback (sm_%d outside supported set {86,89,120})", sm);
+        gpu_log(line);
+        return;
+    }
+    GpuContext* probe_ctx =
+        create_context(64, 64, 4, 256, kContextCandidates, 256, err);
+    if (probe_ctx == nullptr) {
+        gpu_log(("vfshape: gpu fallback (context init failed: " + err + ")").c_str());
+        return;
+    }
+    destroy_context(probe_ctx);
+    fb.gpu_usable.store(true, std::memory_order_release);
 }
 
 // 流水化管线（W3 波2 补完）：专用流 + frame_slot 交替分配 + 在途 job 计数。
@@ -93,6 +197,10 @@ inline bool ensure_context(int pw, int ph, int poses, int features, std::string&
                                poses > s.cap_poses || features > s.cap_feats;
     if (!needs_rebuild) return true;
     guard_rebuild_against_inflight();
+    if (s.ctx == nullptr && consume_init_fail_hook()) {
+        err = "injected context init failure";
+        return false;
+    }
     const int want_w = std::max(s.cap_w, pw);
     const int want_h = std::max(s.cap_h, ph);
     const int want_poses = std::max(s.cap_poses, poses);

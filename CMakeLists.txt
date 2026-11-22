@@ -305,7 +305,32 @@ if(VF_SHAPE_BUILD_TESTS)
     endif()
     add_test(NAME shape_engine_bench COMMAND shape_engine_bench_test)
     list(APPEND VF_TEST_NAMES shape_engine_bench)
+    # W4 回退兜底门（真装配形态同 engine_bitexact）：三分支探测注入/初始化失败
+    # 回退逐位/运行中失败 3 次粘性/auto 默认真跑 GPU + env=cpu 旁路。OFF 构建
+    # 跳行 main 返回 77（ctest Skipped 防假绿，同 bitexact 口径）。
+    add_executable(shape_gpu_fallback_test tests/gpu_fallback_test.cpp
+        src/two_stage.cpp src/two_stage_train.cpp src/matcher.cpp src/polygon.cpp
+        src/coarse_image.cpp src/rescue_score.cpp src/geometric_refinement.cpp
+        vendor/shape_based_matching/line2Dup.cpp)
+    target_include_directories(shape_gpu_fallback_test PRIVATE include src
+        ${OpenCV_INCLUDE_DIRS} vendor/shape_based_matching
+        vendor/shape_based_matching/MIPP)
+    target_link_libraries(shape_gpu_fallback_test PRIVATE ${OpenCV_LIBS}
+        Threads::Threads)
+    if(MSVC)
+        target_compile_options(shape_gpu_fallback_test PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+    endif()
+    if(VF_SHAPE_CUDA)
+        target_sources(shape_gpu_fallback_test PRIVATE src/gpu/gpu_device.cu
+            src/gpu/coarse_kernels.cu src/gpu/fine_windows.cu src/gpu/gpu_backend.cpp
+            src/gpu/coarse_extract.cpp src/gpu/coarse_service.cpp src/gpu/fine_service.cpp)
+        target_compile_definitions(shape_gpu_fallback_test PRIVATE VF_SHAPE_CUDA=1)
+    endif()
+    add_test(NAME shape_gpu_fallback COMMAND shape_gpu_fallback_test)
+    list(APPEND VF_TEST_NAMES shape_gpu_fallback)
     set_tests_properties(${VF_TEST_NAMES} PROPERTIES ENVIRONMENT "${VF_TEST_ENV}")
     set_tests_properties(shape_gpu_bitexact shape_engine_bitexact shape_engine_bench
+        shape_gpu_fallback
         PROPERTIES SKIP_RETURN_CODE 77)
 endif()
