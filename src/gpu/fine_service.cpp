@@ -46,12 +46,14 @@ std::mutex& stats_mutex() {
     return value;
 }
 
-// pinned 回读池（按 frame_slot 借用：同槽由槽分配互斥保证串行）
+// pinned 回读池（按 frame_slot 借用：同槽由槽分配互斥保证串行）；spread 占位
+// 为外部窗分路径的仅尺寸校验载体（容量跨调用复用，波B 免重复分配+清零）
 struct ReadbackPool {
     uint16_t* resp1 = nullptr;
     size_t resp1_cap = 0;
     uint16_t* scores = nullptr;
     size_t scores_cap = 0;
+    std::vector<uint8_t> spread_placeholder;
 };
 
 ReadbackPool& pool(int fs) {
@@ -268,7 +270,7 @@ static std::unique_ptr<FineJob> fine_window_begin(Model& fine, const cv::Mat& wi
     return job;
 }
 
-// 同步段：等 e_resp1 → resp1 拷出 + initial 扫描（与 L0 链重叠）→ 窗分内核流内
+// 同步段：等 e_resp1 → pinned 直读 initial 扫描（与 L0 链重叠）→ 窗分内核流内
 // 发射（按候选容量分块）→ 等 e_d2h → 外部窗分消费收尾
 static std::vector<vf_shape_candidate> fine_window_end(std::unique_ptr<FineJob> job,
                                                        Model& fine, const cv::Mat& window,
@@ -279,14 +281,9 @@ static std::vector<vf_shape_candidate> fine_window_end(std::unique_ptr<FineJob> 
 
     const auto scan_t0 = std::chrono::steady_clock::now();
     if (!event_sync(job->e_resp1, err)) svc::gpu_fail(err);
-    const int cells = job->resp_w1 * job->resp_h1;
-    std::vector<std::vector<uint16_t>> resp1(size_t(job->poses));
-    for (int id = 0; id < job->poses; ++id)
-        resp1[size_t(id)].assign(job->resp1_pinned + size_t(id) * cells,
-                                 job->resp1_pinned + size_t(id + 1) * cells);
     std::vector<InitialCandidate> cands;
-    if (!extract_initial_candidates(resp1, job->resp_w1, job->resp_h1, extract_poses, job->pw,
-                                    job->ph, float(fine_th), cands, err)) {
+    if (!extract_initial_candidates({}, job->resp_w1, job->resp_h1, extract_poses, job->pw,
+                                    job->ph, float(fine_th), cands, err, job->resp1_pinned)) {
         if (err == "candidate budget exceeded")
             fail(VF_SHAPE_SEARCH_BUDGET, {200000.0, 200000.0}, err.c_str());
         svc::gpu_fail(err);
@@ -331,14 +328,16 @@ static std::vector<vf_shape_candidate> fine_window_end(std::unique_ptr<FineJob> 
         }
     }
 
-    // 外部窗分路径不消费宿主 spread 内容（仅尺寸校验），链路 spread 留设备端供
-    // 窗分内核直读，宿主侧仅按尺寸占位
+    // 外部窗分路径不消费宿主 spread 内容（仅尺寸校验），占位缓冲容量跨调用
+    // 复用（波B 免每窗 370KB 分配+清零）；链路 spread 留设备端供窗分内核直读
     const auto extract_t0 = std::chrono::steady_clock::now();
     ExtractResult extract_out;
-    std::vector<uint8_t> spread_host(size_t(job->sw) * size_t(job->sh));
-    if (!extract_coarse_candidates(resp1, job->resp_w1, job->resp_h1, spread_host, job->sw,
+    std::vector<uint8_t>& spread_host = pool(job->fs).spread_placeholder;
+    spread_host.resize(size_t(job->sw) * size_t(job->sh));
+    if (!extract_coarse_candidates({}, job->resp_w1, job->resp_h1, spread_host, job->sw,
                                    job->sh, extract_poses, job->pw, job->ph, float(fine_th),
-                                   extract_out, err, kernel_path ? &scores : nullptr))
+                                   extract_out, err, kernel_path ? &scores : nullptr,
+                                   job->resp1_pinned))
         svc::gpu_fail(err);
 
     {

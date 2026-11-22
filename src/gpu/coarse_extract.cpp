@@ -50,12 +50,11 @@ bool template_fits(const ExtractPoses::Level& l0, const ExtractPoses::Level& l1,
 }
 
 // initialMatches 同式（:1347-1358）：score = v*100/(4*nf)，>= threshold 出候选
-void initial_candidates(const std::vector<uint16_t>& resp, int W, int H,
+void initial_candidates(const uint16_t* map, int W, int H,
                         const ExtractPoses::Level& level1, float threshold, int pose_id,
                         std::vector<CoarseCand>& out) {
     const int T = kT[1], offset = grid_offset(T);
     const int nf = int(level1.feats.size());
-    const uint16_t* map = resp.data();
     for (int r = 0; r < H; ++r)
         for (int c = 0; c < W; ++c) {
             const float score = (*map++ * 100.f) / (4 * nf);
@@ -65,12 +64,15 @@ void initial_candidates(const std::vector<uint16_t>& resp, int W, int H,
 
 // initial 全 pose 提取 + 预算（vendor matchClass :1373-1376 同式：逐 pose 累计，
 // 超 200000 中断报错）。候选序 = pose 序内行主序（refine 消费与外部窗分对齐口径）。
+// resp1_flat 非空=pose-major 扁平直读（波B），否则逐 pose vector。
 bool run_initial_phase(const std::vector<std::vector<uint16_t>>& resp1, int resp_w1,
-                       int resp_h1, const ExtractPoses& poses, int frame_w0, int frame_h0,
+                       int resp_h1, const uint16_t* resp1_flat,
+                       const ExtractPoses& poses, int frame_w0, int frame_h0,
                        float threshold, std::vector<CoarseCand>& candidates, int& initial_count,
                        std::string& err) {
     candidates.clear();
     initial_count = 0;
+    const size_t cells = size_t(resp_w1) * size_t(resp_h1);
     for (int id = 0; id < int(poses.level1.size()); ++id) {
         const auto& level1 = poses.level1[size_t(id)];
         const auto& level0 = poses.level0[size_t(id)];
@@ -81,7 +83,9 @@ bool run_initial_phase(const std::vector<std::vector<uint16_t>>& resp1, int resp
         if (!template_fits(level0, level1, frame_w0, frame_h0, frame_w0 / 2, frame_h0 / 2))
             continue;
         if (level1.feats.empty()) continue;
-        initial_candidates(resp1[size_t(id)], resp_w1, resp_h1, level1, threshold, id, candidates);
+        const uint16_t* row =
+            resp1_flat ? resp1_flat + size_t(id) * cells : resp1[size_t(id)].data();
+        initial_candidates(row, resp_w1, resp_h1, level1, threshold, id, candidates);
         initial_count = int(candidates.size());
         if (initial_count > kInitialBudget) {
             err = "candidate budget exceeded";
@@ -165,7 +169,8 @@ void accumulate_window(const LinearMemory& lm, const ExtractPoses::Level& level0
 bool extract_initial_candidates(
     const std::vector<std::vector<uint16_t>>& resp1, int resp_w1, int resp_h1,
     const ExtractPoses& poses, int frame_w0, int frame_h0, float threshold,
-    std::vector<InitialCandidate>& out_cands, std::string& err) {
+    std::vector<InitialCandidate>& out_cands, std::string& err,
+    const uint16_t* resp1_flat) {
     out_cands.clear();
     const auto bad = [&](const std::string& msg) {
         err = msg;
@@ -175,10 +180,12 @@ bool extract_initial_candidates(
     const int pose_count = int(poses.level1.size());
     if (pose_count == 0 || int(poses.level0.size()) != pose_count)
         return bad("extract poses: level1/level0 pose count mismatch");
-    if (int(resp1.size()) != pose_count) return bad("extract resp1 pose count mismatch");
-    for (int id = 0; id < pose_count; ++id)
-        if (resp1[size_t(id)].size() != size_t(resp_w1) * size_t(resp_h1))
-            return bad("extract resp buffer size mismatch");
+    if (!resp1_flat) {
+        if (int(resp1.size()) != pose_count) return bad("extract resp1 pose count mismatch");
+        for (int id = 0; id < pose_count; ++id)
+            if (resp1[size_t(id)].size() != size_t(resp_w1) * size_t(resp_h1))
+                return bad("extract resp buffer size mismatch");
+    }
     if (frame_w0 <= 0 || frame_h0 <= 0) return bad("extract dims must be positive");
     if (frame_w0 % kT[0] || frame_h0 % kT[0])
         return bad("extract frame dims must be multiples of coarse T");
@@ -187,8 +194,8 @@ bool extract_initial_candidates(
 
     std::vector<CoarseCand> candidates;
     int initial_count = 0;
-    if (!run_initial_phase(resp1, resp_w1, resp_h1, poses, frame_w0, frame_h0, threshold,
-                           candidates, initial_count, err))
+    if (!run_initial_phase(resp1, resp_w1, resp_h1, resp1_flat, poses, frame_w0, frame_h0,
+                           threshold, candidates, initial_count, err))
         return bad(err);
     const int border0 = 8 * kT[0];
     out_cands.resize(candidates.size());
@@ -209,7 +216,8 @@ bool extract_coarse_candidates(
     const std::vector<uint8_t>& spread0, int spread_w, int spread_h,
     const ExtractPoses& poses, int frame_w0, int frame_h0,
     float threshold, ExtractResult& out, std::string& err,
-    const std::vector<uint16_t>* external_scores) {
+    const std::vector<uint16_t>* external_scores,
+    const uint16_t* resp1_flat) {
     out.matches.clear();
     out.extract_ms = 0;
     out.initial_count = 0;
@@ -226,10 +234,12 @@ bool extract_coarse_candidates(
     const int pose_count = int(poses.level1.size());
     if (pose_count == 0 || int(poses.level0.size()) != pose_count)
         return fail("extract poses: level1/level0 pose count mismatch");
-    if (int(resp1.size()) != pose_count) return fail("extract resp1 pose count mismatch");
-    for (int id = 0; id < pose_count; ++id)
-        if (resp1[size_t(id)].size() != size_t(resp_w1) * size_t(resp_h1))
-            return fail("extract resp buffer size mismatch");
+    if (!resp1_flat) {
+        if (int(resp1.size()) != pose_count) return fail("extract resp1 pose count mismatch");
+        for (int id = 0; id < pose_count; ++id)
+            if (resp1[size_t(id)].size() != size_t(resp_w1) * size_t(resp_h1))
+                return fail("extract resp buffer size mismatch");
+    }
     if (spread_w <= 0 || spread_h <= 0 || frame_w0 <= 0 || frame_h0 <= 0)
         return fail("extract dims must be positive");
     if (spread_w != frame_w0 || spread_h != frame_h0)
@@ -246,8 +256,8 @@ bool extract_coarse_candidates(
     // initial 全 pose 提取 + 预算（vendor matchClass :1373-1376 同式：逐 pose 累计，
     // 超 200000 中断；GPU 路径语义=清空报错，与引擎 search budget 报错口径一致）
     std::vector<CoarseCand> candidates;
-    if (!run_initial_phase(resp1, resp_w1, resp_h1, poses, frame_w0, frame_h0, threshold,
-                           candidates, out.initial_count, err))
+    if (!run_initial_phase(resp1, resp_w1, resp_h1, resp1_flat, poses, frame_w0, frame_h0,
+                           threshold, candidates, out.initial_count, err))
         return fail(err);
 
     // 外部窗分（W3）：按 initial 候选序整批校验后逐候选消费

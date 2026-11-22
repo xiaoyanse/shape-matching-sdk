@@ -16,7 +16,10 @@
 namespace vfshape::gpu {
 namespace svc {
 
-constexpr int kContextCandidates = 256;  // ≥W3 窗分分流阈值：免首窗批量触发重建
+// 波A 单次全量批（host-d2h 优化）：候选 ≤4096 单发单同步（centers 一次 H2D+
+// 内核一次全候选+scores 一次 D2H），消除小块 DMA 延迟束腰；显存增量 scores
+// 2MB×双工作面 + centers 微量（登记 R3 ~4MB）；超容候选仍按此容量分块（语义同值）
+constexpr int kContextCandidates = 4096;
 
 // 两级金字塔宿主提取视图（粗层/精修窗服务同构复用，原两处匿名空间副本上提）
 inline bool build_extract_poses(const Model& model, ExtractPoses& poses, std::string& err) {

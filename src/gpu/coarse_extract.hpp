@@ -48,19 +48,25 @@ struct InitialCandidate {
 // uint16 行主序窗格；值域 <32768 由特征数护栏保证）——先用
 // extract_initial_candidates 取候选回填 GPU 窗分再传入。默认空 = 宿主自算，
 // 纯宿主路径零变化。
+// resp1_flat 非空（W6 波B 跨度消费口径）：指向 pose-major 扁平缓冲直读（每 pose
+// resp_w1*resp_h1 格步进，格数=pose 数×网格），忽略 resp1 参数并免逐 pose 尺寸
+// 校验（服务内部调用方契约：缓冲由 pinned 回读池保证）；默认空 = 原 vector 口径
+// 零变化。
 bool extract_coarse_candidates(
     const std::vector<std::vector<uint16_t>>& resp1, int resp_w1, int resp_h1,
     const std::vector<uint8_t>& spread0, int spread_w, int spread_h,
     const ExtractPoses& poses, int frame_w0, int frame_h0,
     float threshold, ExtractResult& out, std::string& err,
-    const std::vector<uint16_t>* external_scores = nullptr);
+    const std::vector<uint16_t>* external_scores = nullptr,
+    const uint16_t* resp1_flat = nullptr);
 
 // initial 阶段独立出口：返回与主入口 initial 阶段同序同量的候选（含 clamp 后
 // 窗中心），供提取方先回填外部窗分。预算/特征数护栏语义同主入口；不消费
-// spread0（不做 spread 校验）。
+// spread0（不做 spread 校验）。resp1_flat 口径同主入口。
 bool extract_initial_candidates(
     const std::vector<std::vector<uint16_t>>& resp1, int resp_w1, int resp_h1,
     const ExtractPoses& poses, int frame_w0, int frame_h0, float threshold,
-    std::vector<InitialCandidate>& out_cands, std::string& err);
+    std::vector<InitialCandidate>& out_cands, std::string& err,
+    const uint16_t* resp1_flat = nullptr);
 
 }  // namespace vfshape::gpu
