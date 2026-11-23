@@ -193,6 +193,10 @@ typedef enum {
     VF_SHAPE_INSUFFICIENT_FEATURES = 18,
     /* 两级容器粗层训练在全部 K 档失败（params：实际尝试的 K 档数）。 */
     VF_SHAPE_COARSE_TRAIN_FAILED = 19,
+    /* 带版本戳模型与当前运行时 OpenCV 三段版本不等（params 依次为：模型
+     * major/minor/revision、运行时 major/minor/revision）。分级合同：无戳
+     * 模型（≤v0.4.0 产物）放行+一次性告警，仅带戳模型严格拒载。 */
+    VF_SHAPE_MODEL_OPENCV_MISMATCH = 20,
     VF_SHAPE_INTERNAL = 99
 } vf_shape_error_code;
 
@@ -375,6 +379,17 @@ VF_SHAPE_API int32_t vf_shape_match_batch(const uint8_t* image, uint64_t image_s
  * 跨线程不可见；本线程无失败历史时 code 为 VF_SHAPE_OK。 */
 VF_SHAPE_API void vf_shape_last_error_info(int32_t* code, double params[6],
     int32_t* param_count);
+
+/* 当前运行时链接的 OpenCV 三段版本（major/minor/revision），out_version[3]
+ * 由库回写。无失败路径。 */
+VF_SHAPE_API void vf_shape_runtime_opencv_version(int32_t out_version[3]);
+
+/* 模型字节（VFSHAPE 单级模型段；两级容器的 fine/coarse 段同构）的 OpenCV
+ * 版本戳查询。*has_stamp 回写 0（无戳=戳机制前产物，out_version 置零）或
+ * 1（带戳，out_version 回写训练时版本）。bytes 非法（签名/结构损坏）返回 1
+ * 并写错误文本，语义与装载校验同一口径；本查询不执行版本拦截（只读）。 */
+VF_SHAPE_API int32_t vf_shape_model_opencv_version(const uint8_t* bytes, uint64_t size,
+    int32_t out_version[3], int32_t* has_stamp, char* error, uint32_t error_capacity);
 
 /* 训练预算查询：按训练同一公式核算配置将占用的姿态数、最大画布与像素
  * 总量。纯计算，不建句柄不碰图像。config->struct_size 与 out->struct_size

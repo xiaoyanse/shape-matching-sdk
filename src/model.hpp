@@ -55,6 +55,10 @@ struct Model {
     vf_shape_train_config config{};
     int width = 0, height = 0;
     std::vector<Pose> poses;
+    // OpenCV 版本戳（容器尾部 TLV tag=1 解析结果）：带戳模型与当前运行时
+    // 三段不等即拒载（MODEL_OPENCV_MISMATCH）；无戳=戳机制引入前产物，放行。
+    int opencv_version[3] = {0, 0, 0};
+    bool opencv_stamped = false;
 
     // 按位姿排列（外层 scale 内层 angle）推导相邻角度档映射——
     // 同 scale 组内 id±1 为相邻角度，组首尾无邻居（-1）。训练后与解码重建后
@@ -91,7 +95,9 @@ std::shared_ptr<Model> train(const cv::Mat& image, const vf_shape_train_config& 
                              const Model* previous_group = nullptr,
                              const struct PolygonShape* polygon = nullptr);
 std::vector<uint8_t> encode(const Model& model);
-std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size);
+// enforce_opencv=false 供版本戳查询侧复用同一解码走查（解析戳但不拦截）
+std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size,
+                              bool enforce_opencv = true);
 std::vector<vf_shape_candidate> match(Model& model, const cv::Mat& image, double threshold);
 PreparedFrame prepare_frame(const cv::Mat& image, const Detector* detector = nullptr);
 void validate_search_budget(const Model& model, int width, int height);

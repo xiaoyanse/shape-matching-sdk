@@ -304,6 +304,26 @@ void vf_shape_last_error_info(int32_t* code, double params[6], int32_t* param_co
     if (params)
         std::copy_n(vfshape::g_last_error.params, 6, params);
 }
+void vf_shape_runtime_opencv_version(int32_t out_version[3]) {
+    vfshape::require(out_version, "missing version output");
+    out_version[0] = CV_VERSION_MAJOR;
+    out_version[1] = CV_VERSION_MINOR;
+    out_version[2] = CV_VERSION_REVISION;
+}
+int32_t vf_shape_model_opencv_version(const uint8_t* bytes, uint64_t size,
+    int32_t out_version[3], int32_t* has_stamp, char* error, uint32_t error_capacity) {
+    return boundary(error, error_capacity, [&] {
+        vfshape::require(out_version && has_stamp, "missing version outputs");
+        // 只读查询：复用解码走查解析戳，不执行版本拦截（enforce=false）
+        const auto model = vfshape::decode(bytes, size, false);
+        if (model->opencv_stamped) {
+            for (int i = 0; i < 3; ++i) out_version[i] = model->opencv_version[i];
+        } else {
+            for (int i = 0; i < 3; ++i) out_version[i] = 0;
+        }
+        *has_stamp = model->opencv_stamped ? 1 : 0;
+    });
+}
 // 预算报告 v1 布局尺寸（polygon_fill_ratio 尾部追加前）：新头部 sizeof=72，
 // 旧头部消费方仍传 64；入口按 struct_size 判别，只回写调用方声明长度的前缀
 constexpr uint32_t kBudgetReportV1Size = 64;

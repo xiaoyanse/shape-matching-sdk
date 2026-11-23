@@ -268,6 +268,84 @@ void group_k_fallback_reason() {
           "实际 rc=" + std::to_string(rc) + "：" + g_error);
 }
 
+// OpenCV 版本戳合同组：尾部 TLV（tag=1）带戳严格比对拒载（码 20）、无戳放行、
+// 查询 API 三态、未知 tag 前瞻兼容、非 TLV 尾垃圾拒绝
+void group_opencv_stamp() {
+    const cv::Mat ref = synth_reference();
+    const auto config = make_config({32, 32, 176, 176}, 0, 0, 1, 1, 1, 1, 20, 40, 32);
+    HandleGuard trained{train_handle(ref, config, "版本戳模板")};
+    const auto container = export_bytes(trained.handle, "版本戳容器");
+    const auto fine = first_fine_segment(container);
+    constexpr size_t kStampBytes = 20;  // 8 字节 TLV 头 + 12 字节三段版本
+
+    // 运行时查询与带戳模型查询
+    int32_t runtime[3] = {0, 0, 0};
+    vf_shape_runtime_opencv_version(runtime);
+    check(runtime[0] == CV_VERSION_MAJOR && runtime[1] == CV_VERSION_MINOR &&
+              runtime[2] == CV_VERSION_REVISION,
+          "运行时版本查询与编译期不一致");
+    int32_t stamped_version[3] = {0, 0, 0}, has_stamp = -1;
+    char quiet_error[8] = {0};
+    check(vf_shape_model_opencv_version(fine.data(), fine.size(), stamped_version,
+                                        &has_stamp, quiet_error, sizeof(quiet_error)) == 0 &&
+              has_stamp == 1 && stamped_version[0] == runtime[0] &&
+              stamped_version[1] == runtime[1] && stamped_version[2] == runtime[2],
+          "带戳段查询应回写训练时版本与运行时一致");
+    HandleGuard loaded{load_handle(container, "带戳容器")};
+    check(loaded.handle != 0, "带戳同版本容器应正常装载");
+
+    // 无戳（剥除尾 TLV）：查询 has_stamp=0 + 装载放行
+    const std::vector<uint8_t> unstamped(fine.begin(), fine.end() - ptrdiff_t(kStampBytes));
+    int32_t unstamped_version[3] = {9, 9, 9};
+    has_stamp = -1;
+    check(vf_shape_model_opencv_version(unstamped.data(), unstamped.size(), unstamped_version,
+                                        &has_stamp, quiet_error, sizeof(quiet_error)) == 0 &&
+              has_stamp == 0 && unstamped_version[0] == 0,
+          "无戳段查询应 has_stamp=0 且版本置零");
+    HandleGuard legacy{load_handle(replace_segment(container, 0, unstamped), "无戳容器")};
+    check(legacy.handle != 0, "无戳（戳机制前产物）容器应放行");
+
+    // 带戳不匹配（major 改 6）：拒载 + 码 20 + 双方版本六槽
+    std::vector<uint8_t> mismatched = fine;
+    mismatched[mismatched.size() - kStampBytes + 8] = 6;
+    const auto mismatch_container = replace_segment(container, 0, mismatched);
+    uint64_t handle = 0;
+    const int32_t rc = vf_shape_load(mismatch_container.data(), mismatch_container.size(),
+                                     &handle, g_error, sizeof(g_error));
+    if (rc == 0 && handle) vf_shape_close(handle, nullptr, 0);
+    int32_t code = 0, param_count = 0;
+    double params[6] = {};
+    vf_shape_last_error_info(&code, params, &param_count);
+    check(rc == 1 && code == VF_SHAPE_MODEL_OPENCV_MISMATCH && param_count == 6 &&
+              params[0] == 6 && params[3] == runtime[0] &&
+              std::string(g_error).find("different OpenCV runtime") != std::string::npos,
+          "带戳不匹配应拒载码 20 带双方版本，实际 rc=" + std::to_string(rc) + " code=" +
+              std::to_string(code) + "：" + g_error);
+
+    // 未知 tag 前瞻兼容：戳 TLV 后追加 tag=99 段仍可装载
+    std::vector<uint8_t> forwarded = fine;
+    const uint8_t unknown_tlv[] = {99, 0, 0, 0, 4, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF};
+    forwarded.insert(forwarded.end(), unknown_tlv, unknown_tlv + sizeof(unknown_tlv));
+    HandleGuard forwarded_handle{
+        load_handle(replace_segment(container, 0, forwarded), "未知 tag 容器")};
+    check(forwarded_handle.handle != 0, "未知 tag 尾段应跳过并正常装载");
+
+    // 非 TLV 尾垃圾（未知 tag 长度声明越界）：按 TAMPER 拒绝
+    std::vector<uint8_t> garbage = fine;
+    const uint8_t bad_tlv[] = {2, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF};
+    garbage.insert(garbage.end(), bad_tlv, bad_tlv + sizeof(bad_tlv));
+    expect_load_reject(replace_segment(container, 0, garbage), "model tail out of range",
+                       "非 TLV 尾垃圾");
+
+    // 查询 API 对垃圾输入：格式口径拒绝
+    const uint8_t junk[16] = {};
+    int32_t junk_version[3] = {0, 0, 0};
+    has_stamp = -1;
+    check(vf_shape_model_opencv_version(junk, sizeof(junk), junk_version, &has_stamp,
+                                        g_error, sizeof(g_error)) == 1,
+          "垃圾输入查询应返回 1");
+}
+
 struct Group {
     const char* name;
     void (*fn)();
@@ -285,6 +363,7 @@ int main() {
         {"n_batch_budget_groups", group_batch_budget_groups},
         {"o_k_fallback_reason", group_k_fallback_reason},
         {"p_legacy_missing_cfg", group_legacy_missing_cfg},
+        {"q_opencv_stamp", group_opencv_stamp},
     };
     int failures = 0;
     for (const auto& group : groups) {

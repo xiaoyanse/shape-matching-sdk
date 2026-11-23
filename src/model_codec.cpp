@@ -1,7 +1,9 @@
 #include "model.hpp"
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 namespace vfshape {
 // 定义于 matcher.cpp：持久化侧严格校验，与训练侧 validate_detector_params 的零默认语义区分
@@ -44,6 +46,11 @@ public:
         return value;
     }
     bool finished() const { return position_ == size_; }
+    uint64_t remaining() const { return size_ - position_; }
+    void skip(uint32_t bytes) {
+        require_coded(size_ - position_ >= bytes, VF_SHAPE_MODEL_TAMPER, "model tail out of range");
+        position_ += bytes;
+    }
 };
 void write_config(Writer& out, const vf_shape_train_config& c) {
     out.integer(c.roi_x); out.integer(c.roi_y);
@@ -63,6 +70,22 @@ int grid_index(const std::vector<double>& values, double value) {
     for (size_t index = 0; index < values.size(); ++index)
         if (std::abs(values[index] - value) < 1e-7) return int(index);
     return -1;
+}
+// 尾部 TLV：OpenCV 版本戳（分级装载合同——带戳严格三段比对拒载；无戳=
+// 戳机制引入前产物（≤v0.4.0）放行+进程级一次性告警，跨版本数值等价已双侧实证）
+constexpr uint32_t kTagOpencvVersion = 1;
+void runtime_opencv_version(int out[3]) {
+    out[0] = CV_VERSION_MAJOR; out[1] = CV_VERSION_MINOR; out[2] = CV_VERSION_REVISION;
+}
+void warn_unstamped_once() {
+    static const bool quiet = std::getenv("VF_SHAPE_TRACE_QUIET") != nullptr;
+    if (quiet) return;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::fprintf(stderr, "[vfshape] model without opencv version stamp loaded "
+                             "(trained by pre-stamp runtime <= v0.4.0); cross-version "
+                             "match parity is verified, continuing\n");
+    });
 }
 }
 
@@ -91,6 +114,11 @@ std::vector<uint8_t> encode(const Model& model) {
             }
         }
     }
+    // 尾部版本戳 TLV（tag=1, 3×u32）：训练导出即写，装载端严格比对
+    out.integer(kTagOpencvVersion); out.integer(12);
+    out.integer(uint32_t(CV_VERSION_MAJOR));
+    out.integer(uint32_t(CV_VERSION_MINOR));
+    out.integer(uint32_t(CV_VERSION_REVISION));
     out.bytes.insert(out.bytes.begin(), signature, signature + sizeof(signature));
     require_coded(out.bytes.size() <= max_model_bytes, VF_SHAPE_MODEL_SIZE,
                   "model byte budget exceeded", double(out.bytes.size()),
@@ -98,7 +126,7 @@ std::vector<uint8_t> encode(const Model& model) {
     return std::move(out.bytes);
 }
 
-std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size) {
+std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size, bool enforce_opencv) {
     require_coded(bytes && size > sizeof(signature) && size <= max_model_bytes,
                   VF_SHAPE_MODEL_SIZE, "invalid model size", double(size),
                   double(max_model_bytes));
@@ -188,7 +216,29 @@ std::shared_ptr<Model> decode(const uint8_t* bytes, uint64_t size) {
         }
         model->poses.push_back(pose); model->detector.append(std::move(pyramid));
     }
-    require_coded(in.finished(), VF_SHAPE_MODEL_TAMPER, "model trailing bytes");
+    if (in.finished()) {
+        // 无戳=戳机制引入前产物：放行 + 进程级一次性告警
+        warn_unstamped_once();
+    } else {
+        while (!in.finished()) {
+            const uint32_t tag = in.integer(), len = in.integer();
+            if (tag == kTagOpencvVersion) {
+                require_coded(len == 12, VF_SHAPE_MODEL_TAMPER, "opencv stamp length mismatch");
+                for (int i = 0; i < 3; ++i) model->opencv_version[i] = int(in.integer());
+                model->opencv_stamped = true;
+            } else {
+                in.skip(len);  // 未知 tag 前瞻兼容：按长度跳过
+            }
+        }
+        int current[3]; runtime_opencv_version(current);
+        const auto& v = model->opencv_version;
+        if (enforce_opencv && model->opencv_stamped &&
+            (v[0] != current[0] || v[1] != current[1] || v[2] != current[2]))
+            fail(VF_SHAPE_MODEL_OPENCV_MISMATCH,
+                 {double(v[0]), double(v[1]), double(v[2]),
+                  double(current[0]), double(current[1]), double(current[2])},
+                 "model trained on a different OpenCV runtime");
+    }
     // 角度插值未消费，解码侧不回填 adjacency（邻居计算跳过）。
     // model->build_pose_adjacency();
     return model;
