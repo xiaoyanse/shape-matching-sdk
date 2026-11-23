@@ -34,7 +34,7 @@ struct CoarseServiceStats {
 const CoarseServiceStats& last_call_stats();
 
 // match(model, small, threshold) 的 GPU 等价（two_stage 粗层段语义，候选收尾同链）
-std::vector<vf_shape_candidate> match_coarse_gpu(Model& coarse, const cv::Mat& small,
+std::vector<vf_shape_candidate> match_coarse_gpu(Model& coarse, const cv::Mat& coarse_img,
                                                  double threshold);
 
 }  // namespace vfshape::gpu

@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$OpenCvRoot = 'C:\opencv\build\x64\vc16',
+    [string]$OpenCvRoot = 'C:\opencv-5.0.0\opencv\build\x64\vc16',
     [string]$VcVarsPath = '',
     [string]$CMakePath = 'cmake.exe',
     [string]$NinjaPath = 'ninja.exe',
@@ -81,6 +81,10 @@ if ($SkipAssemble) {
     return
 }
 New-Item -ItemType Directory -Force $runtimeDir | Out-Null
+# 版本切换防残：装配前清掉旧 world DLL/清单（否则旧 opencv_worldXXXX.dll 滞留，
+# 运行目录出现双 world 而 manifest 只认新版本——消费方解析歧义）
+Remove-Item -LiteralPath (Join-Path $runtimeDir 'opencv_world*.dll'), `
+    (Join-Path $runtimeDir 'runtime-manifest.json') -Force -ErrorAction SilentlyContinue
 Copy-Item -LiteralPath (Join-Path $buildDir 'visionforge_shape.dll') -Destination $runtimeDir -Force
 # W4 PE 导入预验（弹窗红线，装到即验）：静态 cudart 自包含应无 CUDA 运行时 DLL
 # 依赖，nvcuda 延迟加载。python/py 启动器都不在 PATH 时跳过并警告（装配机不强制

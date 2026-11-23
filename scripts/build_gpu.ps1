@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$OpenCvRoot = 'C:\opencv\build\x64\vc16',
+    [string]$OpenCvRoot = 'C:\opencv-5.0.0\opencv\build\x64\vc16',
     [string]$CudaToolkitRoot = '',
     [string]$VcVarsPath = '',
     [string]$CMakePath = 'cmake.exe',

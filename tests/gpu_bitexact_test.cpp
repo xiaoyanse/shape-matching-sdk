@@ -97,9 +97,9 @@ cv::Mat synthetic_frame(int w, int h, uint64_t seed) {
             row[3 * x + 2] = uint8_t(((x / 24) + (y / 24)) % 2 * 255 - (r % 37));
         }
     }
-    cv::circle(img, {w / 4, h / 3}, std::min(w, h) / 6, {200, 40, 120}, -4);
-    cv::circle(img, {2 * w / 3, 3 * h / 4}, std::min(w, h) / 8, {30, 220, 90}, -3);
-    cv::rectangle(img, {w / 2 - 60, h / 2 - 28}, {w / 2 + 72, h / 2 + 30}, {255, 255, 255}, 5);
+    cv::circle(img, cv::Point(w / 4, h / 3), std::min(w, h) / 6, cv::Scalar(200, 40, 120), -4);
+    cv::circle(img, cv::Point(2 * w / 3, 3 * h / 4), std::min(w, h) / 8, cv::Scalar(30, 220, 90), -3);
+    cv::rectangle(img, cv::Point(w / 2 - 60, h / 2 - 28), cv::Point(w / 2 + 72, h / 2 + 30), cv::Scalar(255, 255, 255), 5);
     return img;
 }
 

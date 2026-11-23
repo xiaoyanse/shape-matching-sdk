@@ -12,7 +12,7 @@
 
 ## 构建
 
-前置：MSVC C++ 工具链（vcvars64 可发现）、OpenCV 4 C++ SDK（默认 `C:\opencv\build\x64\vc16`，可被参数覆盖）、CMake、Ninja、PowerShell 7 或 Windows PowerShell。
+前置：MSVC C++ 工具链（vcvars64 可发现）、OpenCV 5 C++ SDK（默认 `C:\opencv-5.0.0\opencv\build\x64\vc16`，可被参数覆盖）、CMake、Ninja、PowerShell 7 或 Windows PowerShell。
 
 ```powershell
 # 编译并装配制品到 dist/runtime（含上游 vendor 字节校验）

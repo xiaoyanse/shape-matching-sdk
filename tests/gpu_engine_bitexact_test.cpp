@@ -143,13 +143,13 @@ void part5_seam_bitexact(vfshape::TwoStageModel& model,
                          const std::vector<et::EngineFrame>& frames) {
     const double coarse_th = std::max(45.0, kThreshold - 20.0);
     for (const auto& frame : frames) {
-        cv::Mat small;
-        vfshape::resize_coarse_image(frame.image, small, model.k);
+        cv::Mat coarse_img;
+        vfshape::resize_coarse_image(frame.image, coarse_img, model.k);
         set_backend("cpu");
-        const auto cpu_cands = vfshape::match(*model.coarse, small, coarse_th);
+        const auto cpu_cands = vfshape::match(*model.coarse, coarse_img, coarse_th);
         set_backend("gpu");
         const auto gpu_cands =
-            vfshape::gpu::match_coarse_gpu(*model.coarse, small, coarse_th);
+            vfshape::gpu::match_coarse_gpu(*model.coarse, coarse_img, coarse_th);
         const std::string tag = std::string("seam ") + frame.name;
         compare_bitexact(tag.c_str(), cpu_cands, gpu_cands);
         std::printf("[engine] %s: cpu_n=%zu gpu_n=%zu bitexact OK\n", tag.c_str(),
@@ -218,28 +218,28 @@ double part5_bench_tier(const char* tag, vfshape::TwoStageModel& model, const cv
     const double coarse_th = std::max(45.0, kThreshold - 20.0);
     cv::Mat scene = et::sparse_background(1920, 1080);
     patch.copyTo(scene(cv::Rect(1216, 396, patch.cols, patch.rows)));
-    cv::Mat small;
-    vfshape::resize_coarse_image(scene, small, model.k);
+    cv::Mat coarse_img;
+    vfshape::resize_coarse_image(scene, coarse_img, model.k);
 
-    for (int i = 0; i < kWarmup; ++i) vfshape::match(*model.coarse, small, coarse_th);
+    for (int i = 0; i < kWarmup; ++i) vfshape::match(*model.coarse, coarse_img, coarse_th);
     std::vector<double> cpu_ms;
     size_t cpu_sink = 0;
     for (int i = 0; i < kLoops; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
-        const auto cands = vfshape::match(*model.coarse, small, coarse_th);
+        const auto cands = vfshape::match(*model.coarse, coarse_img, coarse_th);
         cpu_ms.push_back(et::wall_ms(t0, std::chrono::steady_clock::now()));
         cpu_sink += cands.size();
     }
 
     set_backend("gpu");
     for (int i = 0; i < kWarmup; ++i)
-        vfshape::gpu::match_coarse_gpu(*model.coarse, small, coarse_th);
+        vfshape::gpu::match_coarse_gpu(*model.coarse, coarse_img, coarse_th);
     std::vector<double> gpu_ms, chain_ms, extract_ms, resize_ms;
     std::vector<int> initial;
     size_t gpu_sink = 0;
     for (int i = 0; i < kLoops; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
-        const auto cands = vfshape::gpu::match_coarse_gpu(*model.coarse, small, coarse_th);
+        const auto cands = vfshape::gpu::match_coarse_gpu(*model.coarse, coarse_img, coarse_th);
         gpu_ms.push_back(et::wall_ms(t0, std::chrono::steady_clock::now()));
         gpu_sink += cands.size();
         chain_ms.push_back(vfshape::gpu::last_call_stats().gpu_chain_ms);
@@ -260,7 +260,7 @@ double part5_bench_tier(const char* tag, vfshape::TwoStageModel& model, const cv
     const double speedup = cpu_med / gpu_med;
     std::printf("[engine-bench] %s scene %dx%d small %dx%d coarse_poses=%zu k=%d "
                 "sink=%zu/%zu\n",
-                tag, scene.cols, scene.rows, small.cols, small.rows,
+                tag, scene.cols, scene.rows, coarse_img.cols, coarse_img.rows,
                 model.coarse->poses.size(), model.k, cpu_sink, gpu_sink);
     std::printf("[engine-bench] %s coarse_ms cpu=%8.3fms gpu=%7.3fms speedup=%6.2fx "
                 "[gate >=%.2fx]\n",

@@ -1,5 +1,22 @@
 # 更新日志
 
+## 未发布（OpenCV 5 升级批，2026-11-23）
+
+运行时依赖 OpenCV 4.10 → 5.0.0（官方发布包，world 单体布局不变）。
+
+### 行为变更
+
+- 匹配数值与 4.10 逐位一致（P1 等价 21/21 跨版本复证在案）；训练产物（模型字节）因旋转重采样的坐标映射舍入更新与 4.10 不同——跨版本训练资产不可混用，绑定制品同窗口换装
+- GPU 逐位对拍承重墙全部锚点（fastAtan2/pyrDown/Sobel/INTER_AREA/INTER_NEAREST）在 5.0 逐位保持，GPU 内核零改动；三套件与性能门全绿（窗段 2.57×、全帧 2.30×）
+- OpenCV 原语级：Sobel 5.0 慢 16-30%（端到端影响 <1-2%，性能门实测无感）；warpAffine/INTER_LINEAR resize 数值改动只进训练路径
+
+### 兼容与迁移
+
+- ABI v3 维持；Python 绑定与模型容器格式零变化；旧绑定直接换包
+- 构建前置：OpenCV 5 C++ SDK（默认 `C:\opencv-5.0.0\opencv\build\x64\vc16`；官方包 GitHub 直连慢可用 SourceForge 镜像，字节数对齐 release content-length 校验）
+- 构建注记：CUDA 构建须在 vcvars 环境内（裸 shell 下 nvcc 宿主编译报 C1083）；k8 parity 档对时钟噪声敏感的既有 flake 族在本批复现一次（复跑即绿，未改门）
+- 源码适配：vendor 完整性锁定不可改，以强制包含兼容头补 5.0 geometry 族头（include/opencv_compat.h）；rpcndr `small` 宏撞名改名（无语义变化）
+
 ## v0.4.0（2026-11-22，GPU 加速版）
 
 内置 GPU 加速正式交付——装到即验，无需配置。

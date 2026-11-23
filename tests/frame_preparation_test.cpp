@@ -159,7 +159,7 @@ void regional_preparation(cv::RNG& random) {
                             for (int x = 0; x < 160; ++x) {
                                 const int row = y % step * step + x % step;
                                 const int col = y / step * (160 / step) + x / step;
-                                const uchar value = region.contains({x, y}) ? expected[ori].at<uchar>(row, col) : 170;
+                                const uchar value = region.contains(cv::Point(x, y)) ? expected[ori].at<uchar>(row, col) : 170;
                                 if (actual[ori].at<uchar>(row, col) != value)
                                     throw std::runtime_error("regional preparation changed a response or wrote outside request");
                             }

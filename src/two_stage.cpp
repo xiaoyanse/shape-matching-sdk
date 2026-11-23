@@ -32,18 +32,18 @@ std::vector<vf_shape_candidate> match_two_stage_run(
     MatchProfile profile;
     const int w = image_bgr.cols, h = image_bgr.rows;
     // 粗层：1/k 缩图（4096 接口限制在编排内自然放开——缩图与窗口均小）
-    cv::Mat small;
+    cv::Mat coarse_img;
     MatchProfile::measure(profile.coarse_resize_ms, [&] {
-      resize_coarse_image(image_bgr, small, model.k);
+      resize_coarse_image(image_bgr, coarse_img, model.k);
     });
     std::vector<vf_shape_candidate> coarse_cands;
     // 异常穿透到 ABI boundary 报错：执行失败不得伪装成"无匹配"空结果
     coarse_cands = MatchProfile::measure(profile.coarse_ms, [&] {
 #if defined(VF_SHAPE_CUDA) && VF_SHAPE_CUDA
         if (gpu_seam)
-            return gpu::match_coarse_gpu(*model.coarse, small, std::max(45.0, threshold - 20.0));
+            return gpu::match_coarse_gpu(*model.coarse, coarse_img, std::max(45.0, threshold - 20.0));
 #endif
-        return match(*model.coarse, small, std::max(45.0, threshold - 20.0));
+        return match(*model.coarse, coarse_img, std::max(45.0, threshold - 20.0));
     });
     profile.coarse_candidates = int(coarse_cands.size());
     if (coarse_cands.empty()) {

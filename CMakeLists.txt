@@ -6,8 +6,13 @@ option(VF_SHAPE_AVX2 "Build an experimental AVX2-only kernel" OFF)
 option(VF_SHAPE_PARALLEL_WINDOWS "Evaluate two independent refinement windows concurrently" ON)
 option(VF_SHAPE_PROFILE_STAGES "Emit per-call diagnostic timings and retry counters" OFF)
 option(VF_SHAPE_CUDA "Build the CUDA backend (W1 skeleton: residency + frame upload; static cudart)" OFF)
-find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui)
+find_package(OpenCV 5 REQUIRED COMPONENTS core imgproc highgui)
 find_package(Threads REQUIRED)
+# OpenCV 5 头重组：geometry 族从 imgproc 移出，vendor 源码（完整性哈希锁定）只含
+# imgproc——以强制包含兼容头补位（include/opencv_compat.h，版本守卫双向无害）。
+# NOMINMAX：5.0 头链拉入 windows.h，min/max 宏与 std:: 冲突。
+add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/FI${CMAKE_SOURCE_DIR}/include/opencv_compat.h>)
+add_compile_definitions(NOMINMAX)
 if(VF_SHAPE_CUDA)
     enable_language(CUDA)
     # 加载方案（gpu-port-phase0 §二拍板·甲）：单 DLL + 静态 cudart，免运行时再分发

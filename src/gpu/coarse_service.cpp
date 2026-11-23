@@ -90,17 +90,17 @@ const CoarseServiceStats& last_call_stats() {
     return stats_slot();
 }
 
-std::vector<vf_shape_candidate> match_coarse_gpu(Model& coarse, const cv::Mat& small,
+std::vector<vf_shape_candidate> match_coarse_gpu(Model& coarse, const cv::Mat& coarse_img,
                                                  double threshold) {
     require_coded(std::isfinite(threshold) && threshold > 0 && threshold <= 100,
                   VF_SHAPE_THRESHOLD_INVALID, "invalid similarity threshold", threshold);
-    validate_search_budget(coarse, small.cols, small.rows);
+    validate_search_budget(coarse, coarse_img.cols, coarse_img.rows);
 
     std::lock_guard<std::mutex> lock(svc::service_mutex());
     stats_slot() = {};
 
     const svc::ResidencyFingerprint fp = svc::fingerprint_of(coarse);
-    const cv::Mat padded = pad_for_detector(small);
+    const cv::Mat padded = pad_for_detector(coarse_img);
     const int pw = padded.cols, ph = padded.rows;
 
     std::string err;
@@ -137,8 +137,8 @@ std::vector<vf_shape_candidate> match_coarse_gpu(Model& coarse, const cv::Mat& s
     stats.initial_count = extract_out.initial_count;
 
     PreparedFrame frame;  // 收尾只消费帧宽高（center 越界过滤），features 留空
-    frame.width = small.cols;
-    frame.height = small.rows;
+    frame.width = coarse_img.cols;
+    frame.height = coarse_img.rows;
     frame.padded_width = pw;
     frame.padded_height = ph;
     return collect_hit_objects(coarse, extract_out.matches, frame);
